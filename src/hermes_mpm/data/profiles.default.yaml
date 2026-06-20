@@ -1,0 +1,212 @@
+agent_profiles:
+  calendar:
+    reasoning_effort: none
+    max_iterations: 25
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/calendar.md
+    toolsets:
+      - mcp-fastmail
+      - mcp-knowledge
+      - mcp-workspace
+  calendar-complex:
+    reasoning_effort: none
+    max_iterations: 40
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/calendar.md
+    toolsets:
+      - mcp-fastmail
+      - mcp-knowledge
+      - mcp-workspace
+  calendar-propose:
+    reasoning_effort: none
+    max_iterations: 10
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/calendar-propose.md
+    toolsets:
+      - mcp-fastmail-readonly
+      - mcp-knowledge
+  dealfinder:
+    max_iterations: 10
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/dealfinder.md
+    toolsets:
+      - mcp-dealfinder
+      - mcp-knowledge
+      - mcp-kanban
+  debugger:
+    max_iterations: 40
+    model: deepseek/deepseek-v4-pro
+    provider: openrouter
+    system_prompt_file: /opt/hermes/home/profiles/debugger.md
+    toolsets:
+      - terminal
+      - file
+      - code_execution
+      - skills
+      - mcp-knowledge
+      - mcp-prometheus
+      - mcp-cluster-ops
+  documents:
+    reasoning_effort: none
+    max_iterations: 20
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/documents.md
+    toolsets:
+      - mcp-ocr
+      - mcp-nextcloud-files
+      - mcp-fastmail
+      - mcp-knowledge
+      - mcp-workspace
+      - mcp-nextcloud
+  engineer:
+    max_iterations: 40
+    model: deepseek/deepseek-v4-pro
+    provider: openrouter
+    system_prompt_file: /opt/hermes/home/profiles/engineer.md
+    toolsets:
+      - terminal
+      - file
+      - code_execution
+      - skills
+      - mcp-knowledge
+      - mcp-cluster-ops
+      - mcp-kanban
+      - mcp-github
+  files:
+    reasoning_effort: none
+    max_iterations: 10
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/files.md
+    toolsets:
+      - mcp-workspace
+      - mcp-knowledge
+      - mcp-nextcloud-files
+      - mcp-ocr
+      - mcp-nextcloud
+  homelab:
+    max_iterations: 20
+    model: deepseek/deepseek-v4-flash
+    provider: openrouter
+    system_prompt_file: /opt/hermes/home/profiles/homelab.md
+    toolsets:
+      - mcp-proxmox
+      - mcp-cluster-ops
+      - mcp-prometheus
+      - mcp-knowledge
+  kb:
+    reasoning_effort: none
+    max_iterations: 10
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/kb.md
+    toolsets:
+      - mcp-knowledge
+  mail:
+    reasoning_effort: none
+    max_iterations: 15
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/mail.md
+    toolsets:
+      - mcp-fastmail
+      - mcp-knowledge
+  mcp-builder:
+    max_iterations: 40
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/mcp-builder.md
+    toolsets:
+      - terminal
+      - file
+      - code_execution
+      - skills
+      - mcp-knowledge
+      - mcp-tavily
+      - mcp-exa
+  memory:
+    reasoning_effort: none
+    max_iterations: 8
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/memory.md
+    toolsets:
+      - mcp-knowledge
+      - mcp-kanban
+  ocr:
+    max_iterations: 15
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/ocr.md
+    toolsets:
+      - mcp-ocr
+      - mcp-nextcloud-files
+      - mcp-knowledge
+  ops:
+    reasoning_effort: none
+    max_iterations: 20
+    model: deepseek/deepseek-v4-flash
+    provider: openrouter
+    system_prompt_file: /opt/hermes/home/profiles/ops.md
+    toolsets:
+      - skills
+      - mcp-proxmox
+      - mcp-cluster-ops
+      - mcp-prometheus
+      - mcp-knowledge
+      - mcp-kanban
+      - mcp-ntfy
+  receipts:
+    reasoning_effort: none
+    max_iterations: 15
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/receipts.md
+    toolsets:
+      - mcp-ocr
+      - mcp-fastmail
+      - mcp-workspace
+      - mcp-knowledge
+      - mcp-nextcloud-files
+  search:
+    reasoning_effort: none
+    max_iterations: 10
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/search.md
+    toolsets:
+      - mcp-tavily
+      - mcp-exa
+      - brave-search
+      - mcp-knowledge
+  think:
+    max_iterations: 15
+    model: deepseek/deepseek-v4-pro
+    provider: openrouter
+    system_prompt_file: /opt/hermes/home/profiles/think.md
+    toolsets:
+      - mcp-knowledge
+  version-control:
+    max_iterations: 20
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/version-control.md
+    toolsets:
+      - terminal
+      - file
+      - mcp-knowledge
+      - mcp-github
+  weather:
+    reasoning_effort: none
+    max_iterations: 8
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/weather.md
+    toolsets:
+      - mcp-weather
+  web_researcher:
+    reasoning_effort: none
+    description: Searches and synthesizes research topics.
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt: You are a research synthesis specialist. Reason deeply over
+      topics and return structured, well-sourced findings.
+    toolsets:
+      - brave-search
+      - mcp-knowledge
+  openrouter:
+    reasoning_effort: none
+    max_iterations: 20
+    model: huggingface.co/mradermacher/QwenPaw-Flash-9B-GGUF:Q4_K_M
+    system_prompt_file: /opt/hermes/home/profiles/openrouter.md
+    toolsets:
+      - mcp-openrouter-admin

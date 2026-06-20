@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-mpm"
+version = "0.1.0"
+description = "Multi-agent profile management (MPM) plugin for Hermes Agent — profiles, routing, orchestration."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "hermes-mpm" }]
+dependencies = ["PyYAML>=6.0"]
+
+[project.entry-points."hermes_agent.plugins"]
+hermes_mpm = "hermes_mpm"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hermes_mpm = ["plugin.yaml", "data/*.yaml", "skills/**/*.md"]
+
+[tool.ruff]
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]

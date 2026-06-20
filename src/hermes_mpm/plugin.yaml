@@ -1,0 +1,22 @@
+name: hermes_mpm
+version: 0.1.0
+kind: standalone
+description: >-
+  Multi-agent profile management (MPM) for Hermes. v0.1 is a loadable
+  skeleton: it ships the default set of 22 agent profiles (archetypes),
+  a real `hermes mpm list-profiles` CLI command, and stub capabilities
+  (tier routing, an orchestrate tool, a pre_gateway_dispatch passthrough,
+  and a PM-orchestration skill) that the next task fills in. Each
+  capability is registered in its own try/except so an unknown hook on an
+  older core never blocks plugin load.
+author: hermes-mpm
+entry_point: register
+config_namespace: hermes_mpm
+provides_cli_commands:
+  - mpm
+provides_tools:
+  - hermes_mpm_orchestrate
+provides_hooks:
+  - pre_gateway_dispatch
+provides_skills:
+  - pm_orchestrator
