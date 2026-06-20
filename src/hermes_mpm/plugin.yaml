@@ -1,14 +1,15 @@
 name: hermes_mpm
-version: 0.1.0
+version: 1.0.0
 kind: standalone
 description: >-
-  Multi-agent profile management (MPM) for Hermes. v0.1 is a loadable
-  skeleton: it ships the default set of 22 agent profiles (archetypes),
-  a real `hermes mpm list-profiles` CLI command, and stub capabilities
-  (tier routing, an orchestrate tool, a pre_gateway_dispatch passthrough,
-  and a PM-orchestration skill) that the next task fills in. Each
-  capability is registered in its own try/except so an unknown hook on an
-  older core never blocks plugin load.
+  Multi-agent profile management (MPM) for Hermes. Tiered model routing (a
+  pure-Python deterministic classifier pins the cheapest capable model per
+  request), a parallel orchestrator (one batched delegate_task fans subtasks out
+  across the native ThreadPoolExecutor), and deterministic intent fast-paths
+  (weather / time / disk / service-status answered in-process, no LLM). Ships the
+  default set of 22 agent profiles and a `hermes mpm` CLI (list-profiles +
+  routing dry-run). Each capability registers in its own try/except so an unknown
+  hook on an older core never blocks plugin load.
 author: hermes-mpm
 entry_point: register
 config_namespace: hermes_mpm
@@ -16,6 +17,11 @@ provides_cli_commands:
   - mpm
 provides_tools:
   - hermes_mpm_orchestrate
+provides_commands:
+  - weather
+  - time
+  - diskfree
+  - svcstatus
 provides_hooks:
   - pre_gateway_dispatch
 provides_skills:

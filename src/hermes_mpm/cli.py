@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 
-from . import profiles
+from . import profiles, routing
 
 
 def setup(parser: argparse.ArgumentParser) -> None:
@@ -33,9 +33,20 @@ def setup(parser: argparse.ArgumentParser) -> None:
         "list-profiles",
         help="List the shipped agent profile archetypes (no LLM).",
     )
-    sub.add_parser(
+    routing_p = sub.add_parser(
         "routing",
-        help="Show MPM tier-routing state (stub — not implemented in v0.1).",
+        help="Dry-run classify a sample message: print grouping + tier + model.",
+    )
+    routing_p.add_argument("message", nargs="?", default="", help="Sample message text.")
+    routing_p.add_argument(
+        "--platform",
+        default="telegram",
+        help="Origin platform (telegram/api/cron/cli). Default: telegram.",
+    )
+    routing_p.add_argument(
+        "--profile",
+        default=None,
+        help="Optional agent profile influencing routing (e.g. engineer).",
     )
 
     # Default action when `hermes mpm` is called bare.
@@ -55,11 +66,44 @@ def handle(args: argparse.Namespace) -> int:
     if action in (None, "list-profiles"):
         return _list_profiles()
     if action == "routing":
-        print("hermes mpm routing: not implemented in v0.1 (scaffold).")
-        return 0
+        return _routing(args)
 
     print(f"Unknown mpm action: {action!r}")
     return 2
+
+
+def _routing(args: argparse.Namespace) -> int:
+    """Dry-run-classify a sample message and print grouping + tier + model.
+
+    Why: A no-LLM way to see exactly which tier/model a message would route to,
+    for debugging routing config without touching the gateway.
+    What: Calls routing.classify on the message+platform(+profile), resolves the
+    tier's default model, and prints the three values. CLI platform is reported
+    as opted-out (routing won't fire there at runtime).
+    Test: handle(Namespace(mpm_action="routing", message="is plex up?",
+    platform="telegram")) prints "cheap_workhorse" and returns 0.
+    """
+    message = getattr(args, "message", "") or ""
+    platform = getattr(args, "platform", "telegram") or "telegram"
+    profile = getattr(args, "profile", None)
+
+    if not message.strip():
+        print('usage: hermes mpm routing "<message>" [--platform telegram] [--profile name]')
+        return 2
+
+    grouping, tier = routing.classify(message, platform=platform, profile=profile)
+    tier_cfg = routing.DEFAULT_TIERS.get(tier, {})
+    model = tier_cfg.get("model", "?")
+    enabled = routing._platform_enabled({}, platform)
+
+    print(f"message:   {message!r}")
+    print(f"platform:  {platform}" + ("" if enabled else "  (routing opted-out at runtime)"))
+    if profile:
+        print(f"profile:   {profile}")
+    print(f"grouping:  {grouping}")
+    print(f"tier:      {tier}")
+    print(f"model:     {model}")
+    return 0
 
 
 def _list_profiles() -> int:

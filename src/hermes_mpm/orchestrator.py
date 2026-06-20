@@ -1,76 +1,181 @@
-"""Orchestrate tool stub for hermes-mpm.
+"""Parallel fan-out orchestrate tool for hermes-mpm.
 
-Why: MPM exposes a single ``hermes_mpm_orchestrate`` tool the orchestrator
-profile can call to fan work out to archetypes. v0.1 wires the tool with a
-real schema and validation so the contract is stable; the actual delegation
-fan-out lands in the next task.
-What: ``handle()`` validates args against the schema, echoes back the proposed
-plan (objective + chosen archetype), and returns a JSON string — the same
-shape real tool handlers return.
-Test: Call handle({"objective": "x", "archetype": "ops"}); assert the parsed
-JSON has status="planned" and archetype="ops". Call handle({}) -> JSON error.
+Why: A PM agent that delegates N subtasks one ``delegate_task`` call at a time
+serializes work that could run concurrently. The native ``delegate_task`` batch
+mode already fans tasks out across a ThreadPoolExecutor — so the win is to make
+ONE batched call instead of N sequential ones. ``hermes_mpm_orchestrate`` is the
+single tool that does this: validate caller-supplied subtasks, then issue one
+batched ``delegate_task`` so all profiles run in parallel.
+
+What: ``handle(args)`` validates ``goal`` + ``subtasks`` (each {profile, goal,
+context?}); rejects empty subtasks and unknown profiles with a clean error; then
+calls ``ctx.dispatch_tool("delegate_task", {"tasks": [...], "role": "leaf"})``
+and returns the aggregated JSON result. ``ctx`` is captured in ``register()``
+(set_ctx) — the tool has no other way to reach the registry.
+
+Test: handle({"goal":"g","subtasks":[]}) -> error; unknown profile -> error;
+valid subtasks -> builds the delegate_task tasks payload (mock ctx.dispatch_tool
+and assert the payload shape). See test_orchestrator.py.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
+import logging
+from typing import Any, Dict, List, Optional
 
 from . import profiles
+
+logger = logging.getLogger("hermes_mpm.orchestrator")
 
 TOOLSET_NAME = "hermes-mpm"
 TOOL_NAME = "hermes_mpm_orchestrate"
 
+# Captured at register() time so the tool handler can reach dispatch_tool.
+_CTX = None
+
+DELEGATE_TOOL = "delegate_task"
+LEAF_ROLE = "leaf"
+
 ORCHESTRATE_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
-        "objective": {
+        "goal": {
             "type": "string",
-            "description": "The goal to orchestrate. What the user wants accomplished.",
+            "description": "The overall goal this batch of subtasks serves.",
         },
-        "archetype": {
-            "type": "string",
+        "subtasks": {
+            "type": "array",
             "description": (
-                "Optional target archetype to route the objective to "
-                "(e.g. 'ops', 'engineer'). If omitted, MPM will choose."
+                "Subtasks to run IN PARALLEL. Each runs as its own child agent "
+                "under the given profile. Supply 2+ to get fan-out."
             ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "profile": {
+                        "type": "string",
+                        "description": "Agent archetype to run this subtask (e.g. 'ops').",
+                    },
+                    "goal": {
+                        "type": "string",
+                        "description": "What this subtask must accomplish.",
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional extra context for the subtask.",
+                    },
+                },
+                "required": ["profile", "goal"],
+                "additionalProperties": False,
+            },
+            "minItems": 1,
         },
     },
-    "required": ["objective"],
+    "required": ["goal", "subtasks"],
     "additionalProperties": False,
 }
 
 
-def handle(args: Dict[str, Any], **_kwargs) -> str:
-    """Validate args and echo the proposed plan (STUB — no delegation yet).
+def set_ctx(ctx) -> None:
+    """Capture the plugin context so the tool handler can dispatch_tool.
 
-    Why: Locks the tool's input/output contract so callers and tests are valid
-    before real fan-out exists.
-    What: Requires a non-empty ``objective``; validates an optional
-    ``archetype`` against the shipped profile set; returns a JSON plan.
-    Test: handle({"objective":"deploy"}) -> status="planned"; handle({}) ->
-    JSON with an "error" key; handle({"objective":"x","archetype":"nope"}) ->
-    JSON error naming the unknown archetype.
+    Why: The orchestrate tool must call the native ``delegate_task`` through the
+    registry; ``ctx.dispatch_tool`` is the supported bridge. The tool handler
+    receives only its args, so ctx is stored module-side at register() time.
+    What: Sets the module global ``_CTX``.
+    Test: set_ctx(obj); assert orchestrator._CTX is obj.
     """
-    objective = (args.get("objective") or "").strip()
-    if not objective:
-        return json.dumps({"error": "Missing required parameter: objective"})
+    global _CTX
+    _CTX = ctx
 
-    archetype = (args.get("archetype") or "").strip() or None
-    if archetype is not None and archetype not in profiles.list_archetypes():
-        return json.dumps(
-            {
-                "error": f"Unknown archetype '{archetype}'",
-                "available": profiles.list_archetypes(),
-            }
-        )
 
-    return json.dumps(
-        {
-            "status": "planned",
-            "stub": True,
-            "objective": objective,
-            "archetype": archetype,
-            "note": "hermes-mpm v0.1 scaffold: orchestration plan echoed, not executed.",
+def _validate(args: Dict[str, Any]) -> Optional[str]:
+    """Validate orchestrate args; return an error string or None if valid.
+
+    Why: Fail fast with a clear message before spending any delegation.
+    What: Requires a non-empty ``goal`` and a non-empty ``subtasks`` list where
+    every item has a ``profile`` (known archetype) and a ``goal``.
+    Test: empty subtasks -> message; unknown profile -> message naming it; valid
+    -> None.
+    """
+    goal = (args.get("goal") or "").strip()
+    if not goal:
+        return "Missing required parameter: goal"
+
+    subtasks = args.get("subtasks")
+    if not isinstance(subtasks, list) or not subtasks:
+        return "subtasks must be a non-empty list"
+
+    known = set(profiles.list_archetypes())
+    for i, st in enumerate(subtasks):
+        if not isinstance(st, dict):
+            return f"subtasks[{i}] must be an object"
+        prof = (st.get("profile") or "").strip()
+        sub_goal = (st.get("goal") or "").strip()
+        if not prof:
+            return f"subtasks[{i}] missing 'profile'"
+        if not sub_goal:
+            return f"subtasks[{i}] missing 'goal'"
+        if prof not in known:
+            return f"subtasks[{i}] unknown profile '{prof}'"
+    return None
+
+
+def _build_tasks(subtasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Shape validated subtasks into the delegate_task ``tasks`` payload.
+
+    Why: delegate_task batch mode keys on a list of {profile, goal, context,
+    role}; building it in one place keeps the handler readable and testable.
+    What: Maps each subtask to a task dict, carrying context only when present,
+    and stamping the leaf role so children can't recursively fan out.
+    Test: two subtasks -> two task dicts with matching profile/goal and
+    role="leaf".
+    """
+    tasks: List[Dict[str, Any]] = []
+    for st in subtasks:
+        task: Dict[str, Any] = {
+            "profile": st["profile"].strip(),
+            "goal": st["goal"].strip(),
+            "role": LEAF_ROLE,
         }
+        context = (st.get("context") or "").strip()
+        if context:
+            task["context"] = context
+        tasks.append(task)
+    return tasks
+
+
+def handle(args: Dict[str, Any], **_kwargs) -> str:
+    """Validate subtasks and fan them out via one batched delegate_task call.
+
+    Why: One batched call lets the native ThreadPoolExecutor run all subtasks in
+    parallel instead of serializing N delegations.
+    What: Validates args; on success issues a single
+    ``ctx.dispatch_tool("delegate_task", {"tasks": [...], "role": "leaf"})`` and
+    returns its JSON result; on validation/ctx error returns a JSON error.
+    Test: invalid args -> JSON with "error"; valid args with a mocked ctx ->
+    dispatch_tool called once with the batched tasks payload.
+    """
+    err = _validate(args)
+    if err:
+        return json.dumps({"error": err})
+
+    if _CTX is None or not hasattr(_CTX, "dispatch_tool"):
+        return json.dumps({"error": "orchestrate unavailable: plugin context not initialized"})
+
+    tasks = _build_tasks(args["subtasks"])
+    payload = {"tasks": tasks, "role": LEAF_ROLE}
+
+    logger.info(
+        "hermes-mpm orchestrate: goal=%r fanning out %d subtask(s) in parallel",
+        (args.get("goal") or "").strip()[:80],
+        len(tasks),
     )
+    try:
+        result = _CTX.dispatch_tool(DELEGATE_TOOL, payload)
+    except Exception as exc:
+        logger.warning("hermes-mpm orchestrate: delegate_task dispatch failed: %s", exc)
+        return json.dumps({"error": f"delegate_task dispatch failed: {exc}"})
+
+    return result if isinstance(result, str) else json.dumps(result)

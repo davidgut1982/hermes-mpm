@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-mpm"
-version = "0.1.0"
-description = "Multi-agent profile management (MPM) plugin for Hermes Agent — profiles, routing, orchestration."
+version = "1.0.0"
+description = "Multi-agent profile management (MPM) plugin for Hermes Agent — tiered routing, parallel orchestrator, intent fast-paths."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "hermes-mpm" }]

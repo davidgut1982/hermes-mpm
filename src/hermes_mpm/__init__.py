@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from . import cli, intent, orchestrator
+from . import cli, intent, orchestrator, routing
 
 logger = logging.getLogger("hermes_mpm")
 
@@ -45,18 +45,73 @@ def _read_config(ctx) -> dict:
         return {}
 
 
+def _make_pre_gateway_dispatch(cfg: dict):
+    """Compose intent (text rewrite) then routing (model pin) into one handler.
+
+    Why: The gateway iterates pre_gateway_dispatch results and ``break``s on the
+    first rewrite/allow/skip — so a separately-registered routing hook could be
+    skipped whenever intent rewrites. Composing them guarantees BOTH run: intent
+    decides the rewrite, routing always pins the tier (a side-effect on the
+    gateway session, not a returned value). They don't conflict — intent
+    rewrites ``event.text``; routing sets the session model.
+    What: Returns ``handler(event, gateway, session_store, agent_id=None,
+    **kw)`` that runs the routing side-effect first (so the tier is pinned even
+    when intent short-circuits the LLM is moot, but when intent does NOT match
+    the agent runs on the routed tier), then returns intent's decision. Routing
+    errors are swallowed inside its own handler.
+    Test: with a weather event -> returns the /weather rewrite AND routing ran;
+    with unrelated text -> returns None and routing pinned a tier.
+    """
+    routing_handler = routing.make_dispatch_handler(cfg)
+
+    def composed(event=None, gateway=None, session_store=None, agent_id=None, **kw):
+        # Routing first: pin the tier as a session side-effect (returns None).
+        # If intent then rewrites to a slash command, the deterministic handler
+        # answers in-process and the pinned model is simply unused that turn —
+        # harmless. If intent does NOT match, the agent runs on the routed tier.
+        try:
+            routing_handler(
+                event=event,
+                gateway=gateway,
+                session_store=session_store,
+                agent_id=agent_id,
+                **kw,
+            )
+        except Exception as exc:  # never break dispatch
+            logger.debug("hermes-mpm: routing side-effect error (ignored): %s", exc)
+        return intent.pre_gateway_dispatch(
+            event=event,
+            gateway=gateway,
+            session_store=session_store,
+            agent_id=agent_id,
+            **kw,
+        )
+
+    composed.__name__ = "hermes_mpm_pre_gateway_dispatch"
+    return composed
+
+
 def register(ctx) -> None:
     """Plugin entry point — wire MPM capabilities, each guarded.
 
     Why: One hub so the host's PluginManager has a single register() to call;
     per-capability try/except keeps a single bad hook from failing the whole
     plugin on older cores.
-    What: Registers the ``mpm`` CLI command (real), a pre_gateway_dispatch
-    passthrough (stub), the orchestrate tool (stub), and the PM skill.
-    Test: Run against a fake ctx and assert all four registrations were made.
+    What: Registers the ``mpm`` CLI command, the composed pre_gateway_dispatch
+    (intent fast-paths + tier routing), the four intent slash commands, the
+    orchestrate tool (real parallel fan-out), and the PM skill.
+    Test: Run against a fake ctx and assert the CLI command, the
+    pre_gateway_dispatch hook, the orchestrate tool, the skill, and the four
+    intent commands were all registered.
     """
     cfg = _read_config(ctx)
     logger.debug("hermes-mpm: loaded config namespace '%s' (%d keys)", CONFIG_NAMESPACE, len(cfg))
+
+    # Capture ctx so the orchestrate tool can dispatch_tool("delegate_task", …).
+    try:
+        orchestrator.set_ctx(ctx)
+    except Exception as exc:
+        logger.debug("hermes-mpm: ctx capture for orchestrator skipped: %s", exc)
 
     # 1) `hermes mpm ...` CLI subcommand (REAL list-profiles).
     try:
@@ -73,20 +128,56 @@ def register(ctx) -> None:
     except Exception as exc:
         logger.warning("hermes-mpm: CLI command registration failed: %s", exc)
 
-    # 2) pre_gateway_dispatch passthrough (STUB — returns None).
+    # 2) pre_gateway_dispatch — composed intent fast-paths + tier routing.
     try:
-        ctx.register_hook("pre_gateway_dispatch", intent.passthrough)
+        ctx.register_hook("pre_gateway_dispatch", _make_pre_gateway_dispatch(cfg))
     except Exception as exc:
         logger.debug("hermes-mpm: pre_gateway_dispatch hook skipped: %s", exc)
 
-    # 3) hermes_mpm_orchestrate tool (STUB — validates + echoes plan).
+    # 2b) Intent slash commands the rewrites resolve to (no LLM).
+    for _name, _handler, _desc, _hint in (
+        (
+            "weather",
+            intent.weather_command,
+            "Deterministic weather (Open-Meteo, no LLM). /weather [location]",
+            "<location>",
+        ),
+        (
+            "time",
+            intent.time_command,
+            "Deterministic current time/date (America/Chicago, no LLM).",
+            None,
+        ),
+        (
+            "diskfree",
+            intent.diskfree_command,
+            "Deterministic disk free/used for host hermes (cluster-ops, no LLM).",
+            None,
+        ),
+        (
+            "svcstatus",
+            intent.svcstatus_command,
+            "Deterministic systemd service status on hermes (cluster-ops, no LLM).",
+            "<unit>",
+        ),
+    ):
+        try:
+            _kwargs = {"args_hint": _hint} if _hint else {}
+            ctx.register_command(name=_name, handler=_handler, description=_desc, **_kwargs)
+        except Exception as exc:
+            logger.debug("hermes-mpm: command /%s registration skipped: %s", _name, exc)
+
+    # 3) hermes_mpm_orchestrate tool — real parallel fan-out via delegate_task.
     try:
         ctx.register_tool(
             name=orchestrator.TOOL_NAME,
             toolset=orchestrator.TOOLSET_NAME,
             schema=orchestrator.ORCHESTRATE_SCHEMA,
             handler=orchestrator.handle,
-            description="Plan an MPM orchestration (v0.1 stub: echoes the plan).",
+            description=(
+                "Fan out caller-supplied subtasks to agent profiles IN PARALLEL "
+                "via one batched delegate_task call."
+            ),
             emoji="🧭",
         )
     except Exception as exc:

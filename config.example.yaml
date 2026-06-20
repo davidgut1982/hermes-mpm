@@ -1,0 +1,92 @@
+# hermes-mpm example configuration.
+#
+# Drop the `hermes_mpm` block (and the smart_model_routing toggle) into your
+# Hermes config.yaml. The api_key for the openrouter provider is read from the
+# OPENROUTER_API_KEY environment variable — never hardcode the secret here.
+
+plugins:
+  enabled:
+    - hermes_mpm
+
+# Disable the core's built-in router so hermes-mpm's tiered routing is the
+# single authority over per-session model selection.
+smart_model_routing:
+  enabled: false
+
+hermes_mpm:
+  # Routing writes a COMPLETE session override (incl. api_key) for profiles in
+  # profile_tier_map, so it supersedes the profile's pinned model.
+  profile_precedence: routing_wins
+
+  # Tier -> model. Provider creds come from the `openrouter` block below.
+  tiers:
+    free_background:
+      model: "meta-llama/llama-3.3-70b-instruct:free"
+      fallbacks:
+        - "openai/gpt-oss-120b:free"
+        - "qwen/qwen3-235b-a22b-2507"
+    cheap_workhorse:
+      model: "qwen/qwen3-235b-a22b-2507"
+    main:
+      model: "deepseek/deepseek-v4-flash"
+    strong:
+      model: "deepseek/deepseek-v4-pro"
+    max:
+      model: "anthropic/claude-sonnet-4.6"
+
+  # Profile -> tier. Listed profiles are RE-ROUTED (routing wins). Profiles NOT
+  # listed keep their own model.
+  profile_tier_map:
+    describer: free_background
+    kb: free_background
+    memory: free_background
+    receipts: free_background
+    ocr: free_background
+    engineer: strong
+    debugger: strong
+    homelab: strong
+    mcp-builder: strong
+
+  bulk_profiles:
+    - describer
+    - kb
+    - memory
+    - receipts
+    - ocr
+
+  complexity_keywords:
+    - implement
+    - debug
+    - refactor
+    - diagnose
+    - migrate
+    - architect
+    - broken
+    - failing
+    - design
+    - optimize
+
+  simple_keywords:
+    - status
+    - show
+    - check
+    - list
+
+  thresholds:
+    max_chars: 600
+    max_words: 120
+
+  platforms:
+    cli:
+      enabled: false        # CLI opt-out: keep the operator's pinned local model
+    telegram:
+      enabled: true
+    api_server:
+      enabled: true
+    cron:
+      enabled: true
+
+  openrouter:
+    provider: openrouter
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: OPENROUTER_API_KEY

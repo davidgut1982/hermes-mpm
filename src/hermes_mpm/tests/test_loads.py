@@ -34,12 +34,16 @@ class FakeCtx:
 
         self.manifest = _M()
         self.cli_commands: list[str] = []
+        self.commands: list[str] = []
         self.hooks: list[str] = []
         self.tools: list[str] = []
         self.skills: list[str] = []
 
     def register_cli_command(self, name, help, setup_fn, handler_fn=None, description=""):
         self.cli_commands.append(name)
+
+    def register_command(self, name, handler, description="", **kwargs):
+        self.commands.append(name)
 
     def register_hook(self, hook_name, callback):
         self.hooks.append(hook_name)
@@ -61,6 +65,9 @@ def test_register_runs_clean_and_wires_all_capabilities():
     assert "pre_gateway_dispatch" in ctx.hooks
     assert orchestrator.TOOL_NAME in ctx.tools
     assert "pm_orchestrator" in ctx.skills
+    # The four intent slash commands the rewrites resolve to.
+    for cmd in ("weather", "time", "diskfree", "svcstatus"):
+        assert cmd in ctx.commands
 
 
 def test_profiles_load_real():
@@ -87,13 +94,11 @@ def test_cli_list_profiles_returns_zero(capsys):
     assert "archetype(s)" in out
 
 
-def test_orchestrate_stub_validates():
-    """The orchestrate tool stub validates objective + archetype."""
-    ok = json.loads(orchestrator.handle({"objective": "deploy", "archetype": "ops"}))
-    assert ok["status"] == "planned" and ok["archetype"] == "ops"
-
+def test_orchestrate_validates_required_args():
+    """The orchestrate tool validates goal + subtasks (full behavior in
+    test_orchestrator.py)."""
     missing = json.loads(orchestrator.handle({}))
     assert "error" in missing
 
-    bad = json.loads(orchestrator.handle({"objective": "x", "archetype": "nope"}))
-    assert "error" in bad
+    empty = json.loads(orchestrator.handle({"goal": "g", "subtasks": []}))
+    assert "error" in empty
