@@ -7,7 +7,8 @@ What: ``setup(parser)`` builds the argparse sub-subcommands; ``handle(args)``
 dispatches to the matching action and returns an int exit code.
 Test: Build a parser via setup(), parse ["list-profiles"], call handle(args);
 assert it prints the 22 archetypes and returns 0. Parse ["routing"] -> prints
-the not-implemented notice and returns 0.
+the not-implemented notice and returns 0. Parse ["gate-status"] -> prints gate
+config summary and returns 0 (OK/DISABLED) or non-zero (WARN/misconfigured).
 """
 
 from __future__ import annotations
@@ -49,6 +50,14 @@ def setup(parser: argparse.ArgumentParser) -> None:
         help="Optional agent profile influencing routing (e.g. engineer).",
     )
 
+    sub.add_parser(
+        "gate-status",
+        help=(
+            "Print the configured review-gate state and static seam check. "
+            "Exit 0 on OK or DISABLED; non-zero on misconfiguration (same-lab)."
+        ),
+    )
+
     # Default action when `hermes mpm` is called bare.
     parser.set_defaults(mpm_action=None)
 
@@ -67,6 +76,8 @@ def handle(args: argparse.Namespace) -> int:
         return _list_profiles()
     if action == "routing":
         return _routing(args)
+    if action == "gate-status":
+        return _gate_status_from_live_config()
 
     print(f"Unknown mpm action: {action!r}")
     return 2
@@ -103,6 +114,93 @@ def _routing(args: argparse.Namespace) -> int:
     print(f"grouping:  {grouping}")
     print(f"tier:      {tier}")
     print(f"model:     {model}")
+    return 0
+
+
+def _gate_status_from_live_config() -> int:
+    """Load the live Hermes config and call _gate_status_handler.
+
+    Why: The CLI subcommand needs a live config path for real operator use.
+    What: Best-effort loads the hermes_mpm config namespace; falls back to {} on
+    failure, so gate-status still runs (and reports DISABLED/defaults) even without
+    a full Hermes install.
+    Test: Indirectly tested via test_gate_status_cli_subcommand_dispatches; the
+    live config load is expected to fall back gracefully in test environments.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        config = load_config()
+        cfg_ns = cfg_get(config, "plugins", "entries", "hermes_mpm", default={})
+        raw_config = {"hermes_mpm": cfg_ns if isinstance(cfg_ns, dict) else {}}
+    except Exception:
+        raw_config = {}
+    return _gate_status_handler(raw_config)
+
+
+def _gate_status_handler(raw_config: dict) -> int:
+    """Print the configured gate state and return a scriptable exit code.
+
+    Why: Operators need a queryable, no-LLM check that reports intended config
+    state + static validation without running the gate or touching any live seams.
+    What: Loads ReviewGateConfig from raw_config; derives orchestrator and reviewer
+    labs; prints a summary including seam names; exits 0 on OK or DISABLED, non-zero
+    on misconfiguration (same-lab reviewer → would fail-closed on arm).
+    Test: cross-lab config -> OK + exit 0; same-lab -> WARN + non-zero;
+    enabled=False -> DISABLED + exit 0. All tested in test_gate.py.
+    """
+    from .gate import derive_lab
+    from .gate.config import load_gate_config
+
+    cfg = load_gate_config(raw_config)
+
+    # Seam names the gate registers — static, must match what register_gate uses.
+    _SEAM_HOOK = "pre_tool_call"
+    _SEAM_MIDDLEWARE = "tool_request"
+
+    if not cfg.enabled:
+        print("gate config: DISABLED")
+        print("  enabled:     false")
+        print(f"  seams used:  {_SEAM_HOOK} (hook), {_SEAM_MIDDLEWARE} (middleware)")
+        print("  (seams must exist in the running core to arm, but gate is disabled)")
+        return 0
+
+    orchestrator_lab = derive_lab(cfg.orchestrator_model)
+    reviewer_lab = derive_lab(cfg.reviewer_model)
+    same_lab = bool(orchestrator_lab) and bool(reviewer_lab) and orchestrator_lab == reviewer_lab
+    cross_lab_note = (
+        "SAME (would fail-closed on arm)"
+        if same_lab
+        else "independent" if (orchestrator_lab and reviewer_lab)
+        else f"UNKNOWN (orchestrator_lab={orchestrator_lab!r} — would fail-closed on arm)"
+    )
+
+    orch_lab_str = orchestrator_lab or "(unknown)"
+    rev_lab_str = reviewer_lab or "(unknown)"
+    orch_model_str = cfg.orchestrator_model or "(not set)"
+    print("  enabled:          true")
+    print(f"  reviewer:         {cfg.reviewer_model}  (lab={rev_lab_str})")
+    print(f"  orchestrator:     {orch_model_str}  (lab={orch_lab_str})")
+    print(f"  lab relationship: {cross_lab_note}")
+    print(f"  gated_tiers:      {cfg.gated_tiers}")
+    print(f"  fail_closed:      {str(cfg.fail_closed).lower()}")
+    print(f"  audit_path:       {cfg.audit_path}")
+    print(f"  seams used:       {_SEAM_HOOK} (hook, load-bearing block seam)")
+    print(f"                    {_SEAM_MIDDLEWARE} (middleware, tighten-only path)")
+    print("  note: seams must exist in the running core to arm")
+
+    if same_lab:
+        print(
+            f"gate config: WARN (reviewer lab == orchestrator lab "
+            f"'{orchestrator_lab}' — would fail-closed)"
+        )
+        return 1
+
+    if not orchestrator_lab:
+        print("gate config: WARN (orchestrator lab unknown — would fail-closed on arm)")
+        return 1
+
+    print("gate config: OK (independent reviewer, will arm)")
     return 0
 
 

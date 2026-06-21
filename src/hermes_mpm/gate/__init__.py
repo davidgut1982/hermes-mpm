@@ -205,9 +205,14 @@ def register_gate(ctx, *, raw_config: dict | None = None) -> None:
         logger.warning("review gate: FAILED → BLOCKING ALL DELEGATION")
         return
 
-    # Both seams registered — emit the explicit ACTIVE state line.
+    # Both seams registered — emit the explicit ACTIVE state line with full config
+    # summary so operators can SEE what was armed at a glance without reading config.
     logger.info(
-        "hermes-mpm gate registered (gated_tiers=%s, fail_closed_override=%s)",
-        cfg.gated_tiers, fail_closed_override,
+        "review gate: ACTIVE (reviewer=%s lab=%s, orchestrator_lab=%s, "
+        "gated_tiers=%s, fail_closed=%s)",
+        cfg.reviewer_model,
+        reviewer_lab,
+        orchestrator_lab or "(unknown)",
+        cfg.gated_tiers,
+        str(cfg.fail_closed).lower(),
     )
-    logger.info("review gate: ACTIVE")

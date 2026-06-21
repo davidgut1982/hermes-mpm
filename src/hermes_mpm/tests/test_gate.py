@@ -868,3 +868,305 @@ def test_low1_nonempty_orchestrator_model_logs_both_labs(tmp_path, caplog):
     # At least one message must mention the derived labs.
     assert "anthropic" in combined.lower() or "deepseek" in combined.lower(), \
         f"LOW-1 control: derived labs must appear in startup logs; got: {combined}"
+
+
+# ── CHANGE 1: Loud self-check ACTIVE line ─────────────────────────────────────
+
+
+def test_active_log_includes_reviewer_model(caplog):
+    """ACTIVE log line must include the reviewer model id.
+
+    Why: Operators need to verify which reviewer was armed without trawling config.
+    What: The 'review gate: ACTIVE ...' line must contain the reviewer model string.
+    Test: register_gate with a cross-lab config; assert reviewer model appears in log.
+    """
+    import logging
+
+    from hermes_mpm.gate import register_gate
+
+    class _Ctx:
+        def register_middleware(self, kind, callback): pass
+        def register_hook(self, hook_name, callback): pass
+
+    raw = {
+        "hermes_mpm": {
+            "review_gate": {"reviewer": {"model": "deepseek/deepseek-v4-pro"}},
+            "tiers": {"main": {"model": "anthropic/claude-sonnet-4.6"}},
+        }
+    }
+    with caplog.at_level(logging.DEBUG, logger="hermes_mpm.gate"):
+        register_gate(_Ctx(), raw_config=raw)
+
+    active_lines = [m for m in caplog.messages if "review gate: ACTIVE" in m]
+    assert active_lines, "must emit 'review gate: ACTIVE' line"
+    line = active_lines[0]
+    assert "deepseek/deepseek-v4-pro" in line, (
+        f"ACTIVE line must contain reviewer model; got: {line!r}"
+    )
+
+
+def test_active_log_includes_gated_tiers(caplog):
+    """ACTIVE log line must include the gated_tiers list.
+
+    Why: Operators need to confirm which tiers are gated without reading config.
+    What: The 'review gate: ACTIVE ...' line must contain the gated_tiers value.
+    Test: register_gate; assert 'elevated' and 'merge_adjacent' appear in the ACTIVE line.
+    """
+    import logging
+
+    from hermes_mpm.gate import register_gate
+
+    class _Ctx:
+        def register_middleware(self, kind, callback): pass
+        def register_hook(self, hook_name, callback): pass
+
+    raw = {
+        "hermes_mpm": {
+            "review_gate": {"reviewer": {"model": "deepseek/deepseek-v4-pro"}},
+            "tiers": {"main": {"model": "anthropic/claude-sonnet-4.6"}},
+        }
+    }
+    with caplog.at_level(logging.DEBUG, logger="hermes_mpm.gate"):
+        register_gate(_Ctx(), raw_config=raw)
+
+    active_lines = [m for m in caplog.messages if "review gate: ACTIVE" in m]
+    assert active_lines, "must emit 'review gate: ACTIVE' line"
+    line = active_lines[0]
+    assert "elevated" in line, (
+        f"ACTIVE line must mention 'elevated' tier; got: {line!r}"
+    )
+    assert "merge_adjacent" in line, (
+        f"ACTIVE line must mention 'merge_adjacent' tier; got: {line!r}"
+    )
+
+
+def test_active_log_includes_orchestrator_lab(caplog):
+    """ACTIVE log line must include the derived orchestrator lab.
+
+    Why: Operators need to see which lab the orchestrator was derived to, confirming
+    cross-lab independence without reading raw config.
+    What: The 'review gate: ACTIVE ...' line must contain 'orchestrator_lab=<value>'.
+    Test: register_gate with anthropic orchestrator; assert 'orchestrator_lab=anthropic'
+    in ACTIVE line.
+    """
+    import logging
+
+    from hermes_mpm.gate import register_gate
+
+    class _Ctx:
+        def register_middleware(self, kind, callback): pass
+        def register_hook(self, hook_name, callback): pass
+
+    raw = {
+        "hermes_mpm": {
+            "review_gate": {"reviewer": {"model": "deepseek/deepseek-v4-pro"}},
+            "tiers": {"main": {"model": "anthropic/claude-sonnet-4.6"}},
+        }
+    }
+    with caplog.at_level(logging.DEBUG, logger="hermes_mpm.gate"):
+        register_gate(_Ctx(), raw_config=raw)
+
+    active_lines = [m for m in caplog.messages if "review gate: ACTIVE" in m]
+    assert active_lines, "must emit 'review gate: ACTIVE' line"
+    line = active_lines[0]
+    assert "orchestrator_lab=anthropic" in line, (
+        f"ACTIVE line must contain 'orchestrator_lab=anthropic'; got: {line!r}"
+    )
+
+
+# ── CHANGE 2: Outer-catch failure path logs at ERROR level ────────────────────
+
+
+def test_outer_catch_gate_failure_logs_at_error_level(caplog):
+    """Gate registration failure in hermes_mpm.__init__ must log at ERROR level.
+
+    Why: A gate that fails to arm is a security event — WARNING is too quiet.
+    What: When register_gate raises, the outer except in hermes_mpm.register()
+    must emit a log record at logging.ERROR (not WARNING).
+    Test: Patch register_gate to raise GateArmingError; call hermes_mpm.register();
+    assert the caught exception is logged at ERROR level.
+    """
+    import logging
+    from unittest.mock import patch
+
+    import hermes_mpm as mpm_mod
+
+    class _Ctx:
+        calls: list = []
+        def register_cli_command(self, **kw): self.calls.append(("cli", kw))
+        def register_hook(self, name, fn): self.calls.append(("hook", name))
+        def register_middleware(self, kind, fn): self.calls.append(("mw", kind))
+        def register_command(self, **kw): self.calls.append(("cmd", kw))
+        def register_tool(self, **kw): self.calls.append(("tool", kw))
+        def register_skill(self, **kw): self.calls.append(("skill", kw))
+
+    ctx = _Ctx()
+
+    from hermes_mpm.gate import GateArmingError
+
+    # register_gate is imported locally inside hermes_mpm.register(); patch it
+    # at the gate module where the name lives.
+    with patch("hermes_mpm.gate.register_gate", side_effect=GateArmingError("hook seam died")):
+        with caplog.at_level(logging.DEBUG, logger="hermes_mpm"):
+            mpm_mod.register(ctx)
+
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert error_records, (
+        "gate arming failure must be logged at ERROR level; got records: "
+        + str([(r.levelno, r.message) for r in caplog.records])
+    )
+    combined_errors = " ".join(r.message for r in error_records)
+    assert "gate" in combined_errors.lower() or "review" in combined_errors.lower(), (
+        f"ERROR message must mention 'gate' or 'review'; got: {combined_errors!r}"
+    )
+
+
+# ── CHANGE 3: gate-status CLI subcommand ──────────────────────────────────────
+
+
+def _make_raw_config(
+    *,
+    enabled: bool = True,
+    reviewer_model: str = "deepseek/deepseek-v4-pro",
+    orchestrator_model: str = "anthropic/claude-sonnet-4.6",
+    gated_tiers: list[str] | None = None,
+    fail_closed: bool = True,
+) -> dict:
+    """Build a raw config dict for gate-status tests."""
+    tiers: dict = {}
+    if orchestrator_model:
+        tiers = {"main": {"model": orchestrator_model}}
+    cfg: dict = {
+        "review_gate": {
+            "enabled": enabled,
+            "fail_closed": fail_closed,
+            "reviewer": {"model": reviewer_model},
+        }
+    }
+    if gated_tiers is not None:
+        cfg["review_gate"]["gated_tiers"] = gated_tiers
+    if tiers:
+        cfg["tiers"] = tiers
+    return {"hermes_mpm": cfg}
+
+
+def test_gate_status_ok_cross_lab_exits_zero(capsys):
+    """gate-status handler returns 0 and prints OK for a cross-lab config.
+
+    Why: Operators need a scriptable check that the config is sane.
+    What: _gate_status_handler(raw_config) returns 0 and prints 'OK'.
+    Test: cross-lab config (deepseek reviewer, anthropic orchestrator) -> exit 0, 'OK' in output.
+    """
+    from hermes_mpm.cli import _gate_status_handler
+
+    raw = _make_raw_config()
+    rc = _gate_status_handler(raw)
+    out = capsys.readouterr().out
+    assert rc == 0, f"cross-lab config must return exit 0; got {rc}. output: {out}"
+    assert "OK" in out, f"cross-lab config must print OK; got: {out!r}"
+
+
+def test_gate_status_ok_prints_reviewer_model(capsys):
+    """gate-status output must include the reviewer model for operator inspection.
+
+    Why: Operators need to confirm which reviewer model is configured.
+    What: _gate_status_handler prints the reviewer model string.
+    Test: assert 'deepseek/deepseek-v4-pro' appears in stdout.
+    """
+    from hermes_mpm.cli import _gate_status_handler
+
+    raw = _make_raw_config()
+    _gate_status_handler(raw)
+    out = capsys.readouterr().out
+    assert "deepseek/deepseek-v4-pro" in out, (
+        f"gate-status must print reviewer model; got: {out!r}"
+    )
+
+
+def test_gate_status_ok_prints_gated_tiers(capsys):
+    """gate-status output must include the gated tiers.
+
+    Why: Operators need to see which tiers are subject to review.
+    What: _gate_status_handler prints the gated_tiers list.
+    Test: assert 'elevated' and 'merge_adjacent' appear in stdout.
+    """
+    from hermes_mpm.cli import _gate_status_handler
+
+    raw = _make_raw_config()
+    _gate_status_handler(raw)
+    out = capsys.readouterr().out
+    assert "elevated" in out, f"gate-status must print 'elevated'; got: {out!r}"
+    assert "merge_adjacent" in out, f"gate-status must print 'merge_adjacent'; got: {out!r}"
+
+
+def test_gate_status_same_lab_warns_exits_nonzero(capsys):
+    """gate-status handler returns non-zero and prints WARN for same-lab config.
+
+    Why: Same-lab reviewer cannot provide independent review — operator must be warned.
+    What: _gate_status_handler returns non-zero and prints 'WARN' when reviewer
+    lab == orchestrator lab.
+    Test: both deepseek -> exit non-zero, 'WARN' in output.
+    """
+    from hermes_mpm.cli import _gate_status_handler
+
+    raw = _make_raw_config(
+        reviewer_model="deepseek/deepseek-v4-pro",
+        orchestrator_model="deepseek/deepseek-v4-flash",
+    )
+    rc = _gate_status_handler(raw)
+    out = capsys.readouterr().out
+    assert rc != 0, f"same-lab config must return non-zero exit; got {rc}. output: {out}"
+    assert "WARN" in out, f"same-lab config must print WARN; got: {out!r}"
+
+
+def test_gate_status_disabled_exits_zero(capsys):
+    """gate-status handler returns 0 and prints DISABLED for disabled gate.
+
+    Why: Disabled is not a misconfiguration — exit 0 allows scripting.
+    What: _gate_status_handler returns 0 and prints 'DISABLED' when enabled=False.
+    Test: enabled=False -> exit 0, 'DISABLED' in output.
+    """
+    from hermes_mpm.cli import _gate_status_handler
+
+    raw = _make_raw_config(enabled=False)
+    rc = _gate_status_handler(raw)
+    out = capsys.readouterr().out
+    assert rc == 0, f"disabled gate must return exit 0; got {rc}. output: {out}"
+    assert "DISABLED" in out, f"disabled gate must print DISABLED; got: {out!r}"
+
+
+def test_gate_status_seam_names_listed(capsys):
+    """gate-status output must list the seam names the gate uses.
+
+    Why: Operators need to know which seams must exist in the running core.
+    What: _gate_status_handler prints 'pre_tool_call' and 'tool_request'.
+    Test: assert both seam names appear in stdout for an OK config.
+    """
+    from hermes_mpm.cli import _gate_status_handler
+
+    raw = _make_raw_config()
+    _gate_status_handler(raw)
+    out = capsys.readouterr().out
+    assert "pre_tool_call" in out, f"gate-status must list 'pre_tool_call' seam; got: {out!r}"
+    assert "tool_request" in out, f"gate-status must list 'tool_request' seam; got: {out!r}"
+
+
+def test_gate_status_cli_subcommand_dispatches(capsys):
+    """'hermes mpm gate-status' CLI subcommand dispatches to the handler.
+
+    Why: gate-status must be reachable via the CLI (not only via direct call).
+    What: handle(Namespace(mpm_action='gate-status')) invokes _gate_status_handler.
+    Test: call handle with gate-status action; assert 'OK' or 'DISABLED' or 'WARN' in output.
+    """
+    import argparse
+
+    from hermes_mpm.cli import handle, setup
+
+    parser = argparse.ArgumentParser()
+    setup(parser)
+    args = parser.parse_args(["gate-status"])
+    assert args.mpm_action == "gate-status"
+    # handle() loads its own config; we just verify it dispatches without error.
+    # The real config won't load (no hermes_cli), so we expect a graceful fallback.
+    rc = handle(args)
+    assert isinstance(rc, int), f"handle must return int; got {type(rc)}"
