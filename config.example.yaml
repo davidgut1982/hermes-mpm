@@ -90,3 +90,22 @@ hermes_mpm:
     provider: openrouter
     base_url: "https://openrouter.ai/api/v1"
     api_key_env: OPENROUTER_API_KEY
+
+  # Fail-closed, independent code-review GATE for delegate_task. The reviewer is
+  # an INDEPENDENT model (different lab from the orchestrator); a same-lab pairing
+  # trips the cross-lab guard and blocks all delegate_task. Only the gated tiers
+  # (blast-radius) are reviewed; trivial/standard work passes without a reviewer
+  # call. The reviewer is TIGHTEN-ONLY: it may add constraints or BLOCK, never
+  # grant tools or rewrite the base request.
+  review_gate:
+    enabled: true
+    fail_closed: true
+    gated_tiers:
+      - elevated
+      - merge_adjacent
+    reviewer:
+      provider: openrouter
+      model: deepseek/deepseek-v4-pro
+      base_url: https://openrouter.ai/api/v1
+      api_key_env: OPENROUTER_API_KEY
+      timeout: 30
