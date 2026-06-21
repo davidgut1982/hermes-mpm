@@ -39,11 +39,27 @@ def validate_tighten(base_args: dict, proposed_args: dict) -> tuple[bool, str]:
             return False, f"proposed args removed key '{key}'"
         prop_val = proposed_args[key]
 
+        # Finding 3: type change is never a valid tightening.
+        # e.g. str -> int, str -> list, list -> dict all indicate a rewrite.
+        if type(base_val) is not type(prop_val):
+            return False, (
+                f"key '{key}' type changed from {type(base_val).__name__!r} "
+                f"to {type(prop_val).__name__!r} (type change not permitted)"
+            )
+
         # Rule 2: string values must START WITH the base value (append-only).
         # A longer string that diverges from the base prefix is a rewrite, not a
         # tightening — e.g. "run tests AND delete all production records" is longer
         # than "run tests" but is not a valid append-only tightening.
+        # Finding 2: an empty base string is a degenerate case — any non-empty
+        # proposed value would vacuously pass startswith(""), bypassing the guard.
+        # If base is empty, proposed must also be empty.
         if isinstance(base_val, str) and isinstance(prop_val, str):
+            if base_val == "" and prop_val != "":
+                return False, (
+                    f"key '{key}' base value is empty; proposed must also be empty "
+                    f"(empty-base bypass not permitted)"
+                )
             if not prop_val.startswith(base_val):
                 return False, (
                     f"key '{key}' string does not start with the base value "

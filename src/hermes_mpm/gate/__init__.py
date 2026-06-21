@@ -22,7 +22,13 @@ from .config import ReviewGateConfig, load_gate_config
 
 logger = logging.getLogger("hermes_mpm.gate")
 
-__all__ = ["register_gate", "derive_lab", "ReviewGateAdapter", "ReviewGateConfig"]
+__all__ = [
+    "register_gate",
+    "derive_lab",
+    "ReviewGateAdapter",
+    "ReviewGateConfig",
+    "GateArmingError",
+]
 
 # Provider/prefix -> canonical lab. Checked in order; first match wins.
 _LAB_PREFIXES = (
@@ -70,20 +76,53 @@ def derive_lab(model: str) -> str:
     return provider or m
 
 
+class GateArmingError(RuntimeError):
+    """Raised when the pre_tool_call hook seam cannot be registered.
+
+    Why: The hook seam is the ONLY mechanism that can block delegate_task calls.
+    The tool_request middleware seam can only mutate args (rewrite) — it cannot
+    refuse/block execution. Hermes's apply_tool_request_middleware catches
+    exceptions in middleware callbacks and falls back to original args (see
+    tool_executor.py _apply_tool_request_middleware_for_agent), so raising
+    from middleware also cannot block. Therefore, a gate whose hook seam fails
+    to register has NO blocking capability whatsoever. The correct behaviour is
+    to abort the entire gate registration (which causes _load_plugin to mark the
+    plugin as failed), making the failure visible in logs rather than running
+    silently with a half-armed gate that cannot enforce any blocks.
+    """
+
+
 def register_gate(ctx, *, raw_config: dict | None = None) -> None:
     """Entry point called from hermes_mpm.__init__.register().
 
     Why: Wires the gate into the plugin seams with a cross-lab startup guard.
     What: Loads config; if disabled -> DISABLED (no-op, delegation flows); derives
     labs; same lab OR unknown orchestrator lab OR any seam registration failure ->
-    fail-closed override (block all delegate_task); always emits an explicit gate
-    state line so operators know exactly which mode is active.
+    fail-closed; always emits an explicit gate state line.
     Test: see test_gate.py cross-lab cases and security findings tests.
 
+    Seam registration contract (Finding 1):
+      The pre_tool_call hook is the LOAD-BEARING block seam — it is the ONLY
+      seam that can refuse a delegate_task call. The tool_request middleware
+      seam can only mutate args; Hermes swallows middleware exceptions and
+      falls back to original args, so middleware cannot block under any
+      circumstance.
+
+      Registration order is therefore safety-critical:
+        1. Register pre_tool_call hook FIRST. If it fails, raise GateArmingError
+           immediately (before registering middleware). The plugin loader catches
+           the exception, marks the plugin as failed, and logs a warning — both
+           seams remain unregistered and the failure is visible. A gate that
+           cannot block must not start silently.
+        2. Register tool_request middleware AFTER the hook succeeds. If middleware
+           fails, the hook alone is still active and can block all delegate_task
+           calls; flip the adapter to fail-closed so the hook blocks everything.
+
     Gate state lines emitted (one always fires):
-      "review gate: ACTIVE"           — both seams registered, cross-lab verified
-      "review gate: DISABLED (by config)" — enabled=False (intentional, flows normally)
-      "review gate: FAILED → BLOCKING ALL DELEGATION" — enabled but couldn't wire
+      "review gate: ACTIVE"                    — both seams, cross-lab verified
+      "review gate: DISABLED (by config)"      — enabled=False (intentional)
+      "review gate: FAILED → BLOCKING ALL DELEGATION" — middleware failed; hook active
+      (GateArmingError raised)                 — hook seam failed; gate aborted
     """
     cfg = load_gate_config(raw_config or {})
 
@@ -132,30 +171,33 @@ def register_gate(ctx, *, raw_config: dict | None = None) -> None:
         fail_closed_reason=fail_closed_reason,
     )
 
-    # HIGH-2: the two seams are complementary halves of ONE gate, not independent.
-    # If EITHER seam fails to register, the adapter must enter fail-closed-block-all
-    # mode and the gate must emit a FAILED state line. We track failures across both
-    # registrations and only emit ACTIVE if both succeed.
-    seam_failures: list[str] = []
-
-    try:
-        ctx.register_middleware("tool_request", adapter.middleware_callback)
-    except Exception as exc:
-        seam_failures.append(f"tool_request middleware: {exc}")
-        logger.warning("hermes-mpm gate: tool_request middleware registration failed: %s", exc)
-
+    # Step 1: Register the pre_tool_call hook FIRST — it is the load-bearing
+    # block seam. If it fails, abort gate registration entirely by re-raising.
+    # The caller (_load_plugin in plugins.py) catches Exception, marks the plugin
+    # as failed, and logs a warning. Neither seam is registered, making the
+    # failure explicit rather than silent.
     try:
         ctx.register_hook("pre_tool_call", adapter.hook_callback)
     except Exception as exc:
-        seam_failures.append(f"pre_tool_call hook: {exc}")
-        logger.warning("hermes-mpm gate: pre_tool_call hook registration failed: %s", exc)
+        msg = (
+            f"pre_tool_call hook registration failed: {exc} — "
+            "gate cannot block delegate_task; aborting gate registration. "
+            "Fix the hook seam and restart to arm the gate."
+        )
+        logger.error("hermes-mpm gate: %s", msg)
+        logger.error("review gate: FAILED → GATE ABORTED (hook seam unavailable)")
+        raise GateArmingError(msg) from exc
 
-    if seam_failures:
-        # One or both seams are missing. Flip the adapter to fail-closed so the
-        # registered seam(s) block everything rather than half-enforcing the gate.
+    # Step 2: Register middleware AFTER the hook. If middleware fails, the hook
+    # is still active and can block all delegate_task. Flip the adapter to
+    # fail-closed so the hook blocks everything (no tighten-only path, which
+    # requires middleware). Emit the FAILED state line.
+    try:
+        ctx.register_middleware("tool_request", adapter.middleware_callback)
+    except Exception as exc:
         reason = (
-            "seam registration failed (" + "; ".join(seam_failures) + ") "
-            "— blocking all delegate_task"
+            f"tool_request middleware registration failed: {exc} "
+            "— hook active; blocking all delegate_task (tighten path unavailable)"
         )
         adapter._fail_closed_override = True  # noqa: SLF001
         adapter._fail_closed_reason = reason  # noqa: SLF001
@@ -163,7 +205,7 @@ def register_gate(ctx, *, raw_config: dict | None = None) -> None:
         logger.warning("review gate: FAILED → BLOCKING ALL DELEGATION")
         return
 
-    # MED-2: emit the explicit ACTIVE state line so operators know the gate is up.
+    # Both seams registered — emit the explicit ACTIVE state line.
     logger.info(
         "hermes-mpm gate registered (gated_tiers=%s, fail_closed_override=%s)",
         cfg.gated_tiers, fail_closed_override,

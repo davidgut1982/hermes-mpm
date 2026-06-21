@@ -152,6 +152,78 @@ def test_tighten_list_item_removed_invalid():
     assert reason
 
 
+# Finding 2: empty-base prefix bypass
+# ''.startswith('') is True, so base="" let any proposed value pass the prefix
+# check. Fix: if base is empty and proposed is non-empty -> invalid.
+
+def test_tighten_finding2_empty_base_nonempty_proposed_invalid():
+    """Finding 2: base='' and proposed='inject' must be invalid (not vacuously pass).
+
+    Why: ''.startswith('') is True in Python, so the original check silently
+    allowed any proposed value when the base was an empty string. An attacker
+    could leave the base field empty, then inject arbitrary content as the
+    proposed value and have it pass the startswith guard.
+    Fix: if base_val=='' and prop_val!='' -> invalid.
+    Test: validate_tighten({'goal':''}, {'goal':'inject'}) -> (False, reason).
+    """
+    ok, reason = tighten_mod.validate_tighten({"goal": ""}, {"goal": "inject"})
+    assert ok is False, "Finding 2: empty-base with non-empty proposed must be invalid"
+    assert reason, "reason must be non-empty"
+
+
+def test_tighten_finding2_empty_base_empty_proposed_valid():
+    """Finding 2 control: base='' and proposed='' (both empty) must be valid."""
+    ok, _reason = tighten_mod.validate_tighten({"goal": ""}, {"goal": ""})
+    assert ok is True, "Finding 2 control: both empty is valid (no injection)"
+
+
+def test_tighten_finding2_nonempty_base_startswith_passes():
+    """Finding 2 control: non-empty base with proper prefix extension remains valid."""
+    ok, _reason = tighten_mod.validate_tighten(
+        {"goal": "run tests"}, {"goal": "run tests (read-only)"}
+    )
+    assert ok is True, "Finding 2 control: genuine prefix extension must stay valid"
+
+
+# Finding 3: type-confusion silent pass
+# validate_tighten({'goal':'x'}, {'goal':42}) -> ok (isinstance guards no-op on
+# type mismatch). Fix: check type(base_val) is type(prop_val) before isinstance.
+
+def test_tighten_finding3_str_to_int_invalid():
+    """Finding 3: str->int type change must be invalid.
+
+    Why: isinstance checks in rule 2 (str/str) and rule 3 (list/list) silently
+    no-op when types differ, so a str base and int proposed would skip all
+    guards and pass as valid. A reviewer could inject arbitrary non-string
+    content into substance keys by changing the type.
+    Fix: if type(base_val) is not type(prop_val) -> invalid before isinstance.
+    Test: validate_tighten({'goal':'x'}, {'goal':42}) -> (False, reason).
+    """
+    ok, reason = tighten_mod.validate_tighten({"goal": "x"}, {"goal": 42})
+    assert ok is False, "Finding 3: str->int type change must be invalid"
+    assert "type" in reason.lower() or reason, f"reason must mention type change; got {reason!r}"
+
+
+def test_tighten_finding3_str_to_list_invalid():
+    """Finding 3: str->list type change must be invalid."""
+    ok, reason = tighten_mod.validate_tighten({"goal": "x"}, {"goal": ["x", "inject"]})
+    assert ok is False, "Finding 3: str->list type change must be invalid"
+
+
+def test_tighten_finding3_list_to_dict_invalid():
+    """Finding 3: list->dict type change must be invalid."""
+    ok, reason = tighten_mod.validate_tighten(
+        {"constraints": ["a"]}, {"constraints": {"a": "b"}}
+    )
+    assert ok is False, "Finding 3: list->dict type change must be invalid"
+
+
+def test_tighten_finding3_same_type_still_valid():
+    """Finding 3 control: same-type same-value (str->str) still passes."""
+    ok, _reason = tighten_mod.validate_tighten({"goal": "x"}, {"goal": "x and more"})
+    assert ok is True, "Finding 3 control: str->str with valid prefix must still pass"
+
+
 # ── 4. CROSS-LAB GUARD ──────────────────────────────────────────────────────
 
 
@@ -380,27 +452,56 @@ def test_high1_tighten_prefix_check_on_substance_keys():
 
 
 # HIGH-2: split-seam fail-open on registration error
+#
+# Architecture note (grounded in v0.17.0 plugins.py + middleware.py):
+#
+# The plugin loader (_load_plugin, plugins.py:1589-1594) is NON-FATAL on
+# register() exceptions: it catches Exception, logs a warning, sets
+# loaded.enabled=False, and continues. A gate that silently swallows seam
+# failures would run half-armed with no visible signal.
+#
+# The pre_tool_call hook is the ONLY seam that can block delegate_task.
+# The tool_request middleware seam can only mutate args (returns {"args":...}
+# or None). Hermes's _apply_tool_request_middleware_for_agent (tool_executor.py
+# line 206) catches all middleware exceptions and falls back to original args,
+# so middleware cannot block execution under any circumstance.
+#
+# Therefore the seam registration order is:
+#   1. Register pre_tool_call hook FIRST. If it fails, raise GateArmingError —
+#      the loader catches it and marks the plugin as failed. No seam is
+#      registered. The failure is visible in logs, not silent.
+#   2. Register middleware AFTER the hook. If it fails, the hook alone can block
+#      all delegate_task calls. Flip adapter to fail-closed; emit FAILED state.
 
-def test_high2_hook_registration_failure_fails_closed(tmp_path):
-    """HIGH-2: if register_hook raises, gate must FAIL CLOSED (block all), not go half-active.
+def test_high2_hook_registration_failure_aborts_gate(tmp_path):
+    """HIGH-2 (Finding 1): if register_hook raises, register_gate must raise GateArmingError.
 
-    Why: tool_request middleware and pre_tool_call hook are two halves of one gate.
-    If the hook seam fails to register, BLOCK verdicts are never fired and the
-    gate silently passes everything through on the hook path.
-    Fix: if either seam fails, the adapter enters fail-closed mode and blocks all.
-    Test: monkeypatch ctx.register_hook to raise -> after register_gate, a call
-    that would have been blocked is still blocked (not passed through).
+    Why: The hook is the ONLY blocking seam. Middleware cannot block (Hermes
+    swallows middleware exceptions and falls back to original args). If the hook
+    fails, there is no mechanism to block delegate_task. The correct response is
+    a hard abort: raise GateArmingError so the plugin loader marks the gate
+    plugin as failed (visible in logs), rather than silently running with no
+    blocking capability.
+
+    Actual block outcome asserted: register_gate raises GateArmingError.
+    This means the plugin is NOT loaded, neither seam is registered, and any
+    subsequent delegate_task call is ungated — which is better than silently
+    half-arming a gate that cannot block. The loader's plugin-failed log entry
+    is the signal to the operator.
     """
-    from hermes_mpm.gate import register_gate
+    import pytest  # noqa: PLC0415
+
+    from hermes_mpm.gate import GateArmingError, register_gate  # noqa: PLC0415
 
     registered_middleware: list = []
 
     class _Ctx:
-        def register_middleware(self, kind, callback):
-            registered_middleware.append((kind, callback))
-
         def register_hook(self, hook_name, callback):
             raise RuntimeError("hook registration unavailable")
+
+        def register_middleware(self, kind, callback):
+            # Should NOT be reached — register_gate must raise before this.
+            registered_middleware.append((kind, callback))
 
     raw = {
         "hermes_mpm": {
@@ -411,55 +512,39 @@ def test_high2_hook_registration_failure_fails_closed(tmp_path):
         }
     }
 
-    # register_gate must not propagate the exception (it catches it) but must
-    # ensure the adapter goes fail-closed.
-    register_gate(_Ctx(), raw_config=raw)
+    # ACTUAL BLOCK OUTCOME: register_gate raises GateArmingError.
+    # The plugin loader catches this, marks the plugin as failed, and logs a
+    # warning. No seam is registered — the gate is fully absent, not half-armed.
+    with pytest.raises(GateArmingError, match="pre_tool_call hook registration failed"):
+        register_gate(_Ctx(), raw_config=raw)
 
-    # The middleware was registered; verify it now blocks ALL delegate_task calls
-    # (fail-closed override active) rather than passing them through.
-    assert registered_middleware, "middleware should have been registered"
-    kind, mw_callback = registered_middleware[0]
-    # A normally-allowed trivial task must be treated as blocked (via the
-    # adapter's fail_closed_override flag).  The middleware returns None for
-    # non-tighten decisions, so we probe the adapter directly.
-    # The middleware_callback returns None in fail-closed mode (block is handled
-    # by the hook path which failed), so we verify the adapter was set to
-    # fail-closed by checking that a direct call to the underlying adapter
-    # blocks (returns a block message) when accessed via middleware's adapter.
-    # Since we can't access the adapter directly from ctx, verify via the
-    # middleware callback: a fail-closed adapter blocks even 'allow'-tier tasks.
-    # The middleware returns None (no tighten), but if we get the hook from the
-    # adapter we can check directly.  Use a simpler approach: verify the
-    # middleware_callback is from an adapter whose fail_closed_override is True.
-    # We do this by calling it with a known-gated elevated task and expecting
-    # it to NOT return tightened args (since fail-closed -> block, not tighten).
-    # But the real test is that the hook path was supposed to block: since
-    # hook registration failed, confirm the adapter's fail_closed_override = True
-    # means the middleware also blocks (returns None, not passing args through).
-    # The cleanest check: call the middleware on an elevated task.  If the adapter
-    # is NOT fail-closed, it would call the reviewer and potentially tighten/allow.
-    # If it IS fail-closed, it returns None (decision=block -> neither path mutates).
-    with patch("hermes_mpm.gate.adapter.call_reviewer", return_value="ALLOW") as mock_rv:
-        mw_callback("delegate_task", {"goal": "deploy prod release"}, tool_call_id="hh2")
-    # Reviewer must NOT have been called (fail-closed short-circuits).
-    assert mock_rv.call_count == 0, "HIGH-2: reviewer must not be called in fail-closed mode"
+    # Middleware must NOT have been registered — we raised before reaching it.
+    assert not registered_middleware, (
+        "HIGH-2: middleware must not be registered when hook seam fails "
+        "(gate aborted before middleware step)"
+    )
 
 
-def test_high2_middleware_registration_failure_fails_closed(tmp_path):
-    """HIGH-2: if register_middleware raises, gate must also fail closed.
+def test_high2_middleware_registration_failure_hook_blocks(tmp_path):
+    """HIGH-2: if register_middleware raises, hook seam stays active and blocks all calls.
 
-    The hook seam alone cannot enforce tighten, so middleware failure = fail closed.
+    Why: The hook can block on its own. When middleware fails, flip the adapter
+    to fail-closed so the hook blocks every delegate_task (tighten path is gone,
+    block path still works).
+
+    Actual block outcome asserted: the registered hook_callback returns a
+    blocking message for any delegate_task call — not just a proxy metric.
     """
     from hermes_mpm.gate import register_gate
 
     registered_hooks: list = []
 
     class _Ctx:
-        def register_middleware(self, kind, callback):
-            raise RuntimeError("middleware registration unavailable")
-
         def register_hook(self, hook_name, callback):
             registered_hooks.append((hook_name, callback))
+
+        def register_middleware(self, kind, callback):
+            raise RuntimeError("middleware registration unavailable")
 
     raw = {
         "hermes_mpm": {
@@ -472,13 +557,26 @@ def test_high2_middleware_registration_failure_fails_closed(tmp_path):
 
     register_gate(_Ctx(), raw_config=raw)
 
-    # The hook was registered; it must be in fail-closed mode.
+    # The hook was registered (hook runs before middleware in the new order).
     assert registered_hooks, "hook should have been registered"
     hook_name, hook_callback = registered_hooks[0]
-    # ANY delegate_task call must be blocked (fail-closed override).
-    msg = hook_callback("delegate_task", {"goal": "list the services"}, tool_call_id="hh3")
-    assert msg is not None, "HIGH-2: hook must block all calls when middleware failed"
-    assert "[review-gate]" in msg or "block" in msg.lower()
+    assert hook_name == "pre_tool_call"
+
+    # ACTUAL BLOCK OUTCOME: hook_callback returns a non-None block message for
+    # ANY delegate_task call — trivial, standard, elevated — because the adapter
+    # is in fail-closed mode (middleware failure → no tighten path → block all).
+    for goal, label in [
+        ("list the services", "trivial"),
+        ("run the tests", "standard"),
+        ("deploy prod release", "elevated"),
+    ]:
+        msg = hook_callback("delegate_task", {"goal": goal}, tool_call_id=f"hh3_{label}")
+        assert msg is not None, (
+            f"HIGH-2: hook must block {label!r} delegate_task when middleware failed; got None"
+        )
+        assert "[review-gate]" in msg or "block" in msg.lower(), (
+            f"HIGH-2: block message must contain '[review-gate]' or 'block'; got {msg!r}"
+        )
 
 
 # HIGH-3: empty TIGHTEN: is a silent ALLOW
@@ -625,17 +723,55 @@ def test_med2_gate_disabled_emits_explicit_state_line(caplog):
         f"MED-2: must emit 'review gate: DISABLED'; got: {caplog.messages}"
 
 
-def test_med2_gate_failed_emits_explicit_blocking_state_line(caplog):
-    """MED-2: when gate fails to register (seam error), emits 'review gate: FAILED' line."""
+def test_med2_gate_failed_hook_emits_explicit_blocking_state_line(caplog):
+    """MED-2: when hook seam fails, GateArmingError is raised and FAILED log emitted.
+
+    The hook seam is load-bearing. Failure aborts gate registration entirely
+    (raises GateArmingError) and must emit a 'review gate: FAILED' log line
+    before raising, so operators see the failure reason in logs.
+    """
+    import logging  # noqa: PLC0415
+
+    import pytest  # noqa: PLC0415
+
+    from hermes_mpm.gate import GateArmingError, register_gate  # noqa: PLC0415
+
+    class _Ctx:
+        def register_hook(self, hook_name, callback):
+            raise RuntimeError("unavailable")
+
+        def register_middleware(self, kind, callback):
+            raise RuntimeError("unavailable")
+
+    raw = {
+        "hermes_mpm": {
+            "review_gate": {"reviewer": {"model": "deepseek/deepseek-v4-pro"}},
+            "tiers": {"main": {"model": "anthropic/claude-sonnet-4.6"}},
+        }
+    }
+
+    with caplog.at_level(logging.DEBUG, logger="hermes_mpm.gate"):
+        with pytest.raises(GateArmingError):
+            register_gate(_Ctx(), raw_config=raw)
+
+    all_messages = " ".join(caplog.messages)
+    assert "review gate: FAILED" in all_messages or "GATE ABORTED" in all_messages, \
+        f"MED-2: must emit 'review gate: FAILED' or 'GATE ABORTED'; got: {caplog.messages}"
+
+
+def test_med2_gate_failed_middleware_emits_explicit_blocking_state_line(caplog):
+    """MED-2: when middleware seam fails (hook OK), emits 'review gate: FAILED' line."""
     import logging
 
     from hermes_mpm.gate import register_gate
 
-    class _Ctx:
-        def register_middleware(self, kind, callback):
-            raise RuntimeError("unavailable")
+    registered = {"hooks": {}}
 
+    class _Ctx:
         def register_hook(self, hook_name, callback):
+            registered["hooks"][hook_name] = callback
+
+        def register_middleware(self, kind, callback):
             raise RuntimeError("unavailable")
 
     raw = {
