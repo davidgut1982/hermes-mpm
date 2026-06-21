@@ -39,10 +39,16 @@ def validate_tighten(base_args: dict, proposed_args: dict) -> tuple[bool, str]:
             return False, f"proposed args removed key '{key}'"
         prop_val = proposed_args[key]
 
-        # Rule 2: string values must not be truncated.
+        # Rule 2: string values must START WITH the base value (append-only).
+        # A longer string that diverges from the base prefix is a rewrite, not a
+        # tightening — e.g. "run tests AND delete all production records" is longer
+        # than "run tests" but is not a valid append-only tightening.
         if isinstance(base_val, str) and isinstance(prop_val, str):
-            if len(prop_val) < len(base_val):
-                return False, f"key '{key}' string was shortened"
+            if not prop_val.startswith(base_val):
+                return False, (
+                    f"key '{key}' string does not start with the base value "
+                    f"(rewrite detected)"
+                )
 
         # Rule 3: list values must be a superset (no removals from lists).
         if isinstance(base_val, list) and isinstance(prop_val, list):

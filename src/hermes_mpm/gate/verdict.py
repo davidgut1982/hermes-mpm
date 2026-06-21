@@ -55,9 +55,14 @@ def parse_verdict(reviewer_output: str | None, *, error: str | None = None) -> V
             block_reasons.append(reason or "blocked by reviewer")
         elif upper.startswith("TIGHTEN"):
             constraint = line[len("TIGHTEN"):].lstrip(":").strip()
-            if constraint:
+            if not constraint:
+                # A bare "TIGHTEN:" with no constraint text is MALFORMED.
+                # Fail closed: an empty tighten is indistinguishable from ALLOW
+                # and must never silently pass the call through unchanged.
+                block_reasons.append("malformed tighten: empty constraint text")
+            else:
                 constraints.append(constraint)
-            saw_tighten = True
+                saw_tighten = True
         elif upper.startswith("ALLOW"):
             saw_allow = True
 

@@ -14,18 +14,44 @@ import json
 import re
 from pathlib import Path
 
-# Matches `<sensitive-name><sep><value>` and replaces the value with <REDACTED>.
+# Pass 1: field-name redaction.  Matches `<sensitive-name><sep><value>` in JSON/KV
+# serialized text and replaces the value with <REDACTED>.
 # Sep covers JSON ("key": "val"), kv (key=val), and bare (key: val) forms.
-_REDACT_RE = re.compile(
-    r'(?i)(api_key|token|secret|password|credential|bearer)'
+_REDACT_NAME_RE = re.compile(
+    r'(?i)(api[_-]?key|token|secret|pass(?:word|phrase)?|credential|bearer)'
     r'(["\s:=]+)'
     r'([^\s,"\'}{]+)'
 )
 
+# Pass 2: value-pattern redaction.  Catches secrets stored under unexpected field
+# names (e.g. DB_PASS, PGPASSWORD) or embedded in goal/task strings as kv pairs.
+# Pattern 1: `word=value` or `word: value` where `word` looks like a credential name.
+_REDACT_KV_RE = re.compile(
+    r'(?i)(pass(?:word|phrase)?|secret|token|api[_-]?key)\s*[=:]\s*(\S+)'
+)
+
+# Pass 3: high-entropy blob redaction.  Long (≥32 chars) runs of base64/hex-like
+# chars are almost always tokens, keys, or hashes and must not persist in the log.
+_REDACT_ENTROPY_RE = re.compile(r'[A-Za-z0-9+/]{32,}')
+
 
 def _redact(text: str) -> str:
-    """Mask sensitive values in a serialized record string."""
-    return _REDACT_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<REDACTED>", text)
+    """Mask sensitive values in a serialized record string.
+
+    Why: Defence in depth — three passes catch field-name matches, embedded kv
+    pairs under unexpected names, and raw high-entropy blobs respectively.
+    What: Returns the string with sensitive substrings replaced by <REDACTED>.
+    Test: see test_gate.py MED-1 cases (DB_PASS, passphrase= in goal, long blob).
+    """
+    # Pass 1: known-name field redaction (JSON/KV/bare).
+    text = _REDACT_NAME_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}<REDACTED>", text
+    )
+    # Pass 2: embedded kv pairs with credential-like key names.
+    text = _REDACT_KV_RE.sub(lambda m: f"{m.group(1)}=<REDACTED>", text)
+    # Pass 3: high-entropy blobs (≥32 contiguous base64/alphanum chars).
+    text = _REDACT_ENTROPY_RE.sub("<REDACTED>", text)
+    return text
 
 
 class AuditStore:
