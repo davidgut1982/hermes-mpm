@@ -196,4 +196,14 @@ def register(ctx) -> None:
     except Exception as exc:
         logger.debug("hermes-mpm: skill registration skipped: %s", exc)
 
+    # 5) Review gate — fail-closed delegate_task reviewer.
+    try:
+        from .gate import register_gate
+
+        # register_gate expects the full namespace (it reads hermes_mpm.review_gate
+        # and hermes_mpm.tiers); _read_config returns the hermes_mpm inner dict.
+        register_gate(ctx, raw_config={CONFIG_NAMESPACE: cfg})
+    except Exception as exc:
+        logger.warning("hermes-mpm: review gate registration failed: %s", exc)
+
     logger.info("hermes-mpm registered: mpm CLI + pre_gateway_dispatch + orchestrate tool + skill")
