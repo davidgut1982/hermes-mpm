@@ -1,11 +1,14 @@
-"""Decision-matrix tests for the hermes-mpm tier classifier and dispatch handler.
+"""Decision-matrix tests for the hermes-mpm tier classifier and pre_llm_call handler.
 
 Why: Routing is the core feature and money-saving lever — a wrong tier either
 overspends or under-serves. The classifier is a pure function, so its decision
 matrix is exhaustively unit-testable with zero LLM/gateway. The dispatch handler
-is tested against a fake gateway to prove it writes the COMPLETE override and
-evicts the cached agent (the mechanism that supersedes a profile's pinned model).
-What: Asserts the precedence rules and the override-write side-effect.
+now runs on the cross-surface ``pre_llm_call`` seam: it reads ``user_message``/
+``platform``/``model`` from kwargs and RETURNS a complete model bundle dict
+(``{model, provider, api_key, base_url, api_mode}``) that the engine applies via
+switch_model — no gateway-internal coupling, so it works identically on
+gateway/TUI/dashboard.
+What: Asserts the precedence rules and the returned bundle.
 Test: this file — run pytest.
 """
 
@@ -63,97 +66,119 @@ def test_low_urgency_routes_background():
     assert tier == TIER_FREE_BACKGROUND
 
 
-def test_cli_platform_opted_out():
-    # CLI/local is opt-out by default; the dispatch gate must say so.
+def test_tui_and_dashboard_route_like_telegram():
+    """Per the cross-surface unification: tui/dashboard ROUTE (not opted out)."""
+    assert routing._platform_enabled({}, "tui") is True
+    assert routing._platform_enabled({}, "dashboard") is True
+    assert routing._platform_enabled({}, "telegram") is True
+    # Bare "cli" / "local" still default off (honored manual /model there).
     assert routing._platform_enabled({}, "cli") is False
     assert routing._platform_enabled({}, "local") is False
-    assert routing._platform_enabled({}, "telegram") is True
+    # Explicit enabled flag overrides the default.
+    assert routing._platform_enabled({"platforms": {"cli": {"enabled": True}}}, "cli") is True
 
 
-# ── Dispatch handler: override write + eviction ─────────────────────────────
+# ── pre_llm_call handler: returns a complete model bundle ────────────────────
 
 
-class _FakeSource:
-    platform = "telegram"
-    profile = None
-
-
-class _FakeEvent:
-    def __init__(self, text):
-        self.text = text
-        self.source = _FakeSource()
-        self.platform = "telegram"
-        self.urgency = None
-
-
-class _FakeGateway:
-    def __init__(self):
-        self._session_model_overrides = {}
-        self.evicted = []
-
-    def _session_key_for_source(self, source):
-        return "agent:main:telegram:dm"
-
-    def _evict_cached_agent(self, key):
-        self.evicted.append(key)
-
-
-def test_dispatch_writes_complete_override_and_evicts(monkeypatch):
+def test_handler_returns_complete_bundle(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-123")
-    handler = routing.make_dispatch_handler({})
-    gw = _FakeGateway()
+    handler = routing.make_pre_llm_call_handler({})
 
-    ret = handler(event=_FakeEvent("implement a feature"), gateway=gw)
-    assert ret is None  # routing never rewrites text
+    bundle = handler(
+        user_message="implement a feature",
+        platform="telegram",
+        model="deepseek/deepseek-v4-flash",  # a known tier model (main)
+    )
+    assert bundle is not None
+    assert bundle["model"] == routing.DEFAULT_TIERS[TIER_STRONG]["model"]
+    assert bundle["api_key"] == "sk-test-123"
+    assert bundle["base_url"] == routing.OPENROUTER_BASE_URL
+    assert bundle["provider"] == "openrouter"
+    # api_mode key present (None = OpenAI-compatible).
+    assert "api_mode" in bundle
 
-    key = "agent:main:telegram:dm"
-    override = gw._session_model_overrides[key]
-    # Complete bundle so it supersedes any profile-pinned model.
-    assert override["model"] == routing.DEFAULT_TIERS[TIER_STRONG]["model"]
-    assert override["api_key"] == "sk-test-123"
-    assert override["base_url"] == routing.OPENROUTER_BASE_URL
-    assert override["provider"] == "openrouter"
-    assert override["_hermes_mpm"] is True
-    assert gw.evicted == [key]
 
-
-def test_dispatch_respects_manual_model_override(monkeypatch):
+def test_handler_respects_manual_model_pin(monkeypatch):
+    """A foreign (operator-pinned) model must NOT be overridden."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-123")
-    handler = routing.make_dispatch_handler({})
-    gw = _FakeGateway()
-    key = "agent:main:telegram:dm"
-    # A manual /model override has no _hermes_mpm marker — must not be stomped.
-    gw._session_model_overrides[key] = {"model": "manual/model", "api_key": "x"}
+    handler = routing.make_pre_llm_call_handler({})
 
-    handler(event=_FakeEvent("implement a feature"), gateway=gw)
-    assert gw._session_model_overrides[key]["model"] == "manual/model"
-    assert gw.evicted == []  # nothing changed
+    out = handler(
+        user_message="implement a feature",
+        platform="telegram",
+        model="anthropic/claude-opus-4.6",  # not any tier model → manual pin
+    )
+    assert out is None  # deferred to the operator's pin
 
 
-def test_dispatch_opts_out_on_cli(monkeypatch):
+def test_handler_opts_out_on_cli(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-123")
-    handler = routing.make_dispatch_handler({})
-    gw = _FakeGateway()
-
-    class _CliSource:
-        platform = "local"
-        profile = None
-
-    class _CliEvent:
-        text = "implement a feature"
-        source = _CliSource()
-        platform = "local"
-        urgency = None
-
-    handler(event=_CliEvent(), gateway=gw)
-    assert gw._session_model_overrides == {}
-    assert gw.evicted == []
+    handler = routing.make_pre_llm_call_handler({})
+    out = handler(
+        user_message="implement a feature",
+        platform="cli",
+        model="deepseek/deepseek-v4-flash",
+    )
+    assert out is None
 
 
-def test_dispatch_no_apikey_writes_nothing(monkeypatch):
+def test_handler_no_apikey_returns_none(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    handler = routing.make_dispatch_handler({})
-    gw = _FakeGateway()
-    handler(event=_FakeEvent("implement a feature"), gateway=gw)
-    # No creds → no half-override that could lose to a profile.
-    assert gw._session_model_overrides == {}
+    handler = routing.make_pre_llm_call_handler({})
+    out = handler(
+        user_message="implement a feature",
+        platform="telegram",
+        model="deepseek/deepseek-v4-flash",
+    )
+    # No creds → no half-bundle the engine couldn't apply.
+    assert out is None
+
+
+def test_handler_empty_message_returns_none(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-123")
+    handler = routing.make_pre_llm_call_handler({})
+    assert handler(user_message="", platform="telegram", model="x") is None
+
+
+def test_resolve_tier_per_tier_provider_override(monkeypatch):
+    """A tier may override the shared provider block (free_background → OpenRouter
+    while the shared block targets z.ai)."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-1")
+    config = {
+        "openrouter": {
+            "provider": "zai",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "api_key": "sk-zai",
+        },
+        "tiers": {
+            "strong": {"model": "glm-5.2"},
+            "free_background": {
+                "model": "meta-llama/llama-3.3-70b-instruct:free",
+                "provider": "openrouter",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key_env": "OPENROUTER_API_KEY",
+            },
+        },
+    }
+    strong = routing.resolve_tier_override("strong", config)
+    assert strong["provider"] == "zai"
+    assert strong["base_url"] == "https://api.z.ai/api/coding/paas/v4"
+    assert strong["api_key"] == "sk-zai"
+
+    free = routing.resolve_tier_override("free_background", config)
+    assert free["provider"] == "openrouter"
+    assert free["base_url"] == "https://openrouter.ai/api/v1"
+    assert free["api_key"] == "sk-or-1"  # from OPENROUTER_API_KEY env
+
+
+def test_handler_errors_are_swallowed(monkeypatch):
+    """A misbehaving classify must never raise out of the handler."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-123")
+    handler = routing.make_pre_llm_call_handler({})
+
+    def _boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(routing, "classify", _boom)
+    assert handler(user_message="implement", platform="telegram", model="x") is None

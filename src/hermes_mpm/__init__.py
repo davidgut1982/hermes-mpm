@@ -8,7 +8,7 @@ What: ``register(ctx)`` is the entry-point hub. It reads plugin config from the
 unknown hook on an older core can never block plugin load (mirrors the
 hermes-diagnostics pattern).
 Test: Import this module, call register(<fake ctx recording calls>); assert it
-registers a CLI command "mpm", a "pre_gateway_dispatch" hook, the
+registers a CLI command "mpm", a "pre_llm_call" hook, the
 "hermes_mpm_orchestrate" tool, and the "pm_orchestrator" skill, without raising.
 """
 
@@ -29,65 +29,72 @@ _SKILL_PATH = Path(__file__).resolve().parent / "skills" / "pm_orchestrator" / "
 def _read_config(ctx) -> dict:
     """Best-effort read of this plugin's config namespace.
 
-    Why: v1 will key routing behavior off config; v0.1 just proves the read
-    path works and never fails load if config is absent.
-    What: Returns the ``plugins.entries.hermes_mpm`` style config dict, or {}.
-    Test: With a ctx whose manifest lacks config, returns {} and does not raise.
+    Why: The routing/tier config lives at the TOP-LEVEL ``hermes_mpm`` block
+    (``tiers``, ``openrouter``, ``profile_tier_map`` …), while the review-gate
+    config lives under ``plugins.entries.hermes_mpm`` (host convention for
+    plugin-entry config). Routing must read the top-level block or it silently
+    falls back to DEFAULT_TIERS (ignoring the operator's z.ai tier remap). We
+    merge both, top-level winning, so routing sees its tiers AND the gate keeps
+    its entry-scoped keys.
+    What: Returns ``{**plugins.entries.hermes_mpm, **hermes_mpm}`` (top-level
+    wins), or {} when neither exists. Never fails load if config is absent.
+    Test: a config with top-level ``hermes_mpm.tiers.strong.model == glm-5.2``
+    yields a cfg whose ``tiers['strong']['model'] == 'glm-5.2'``.
     """
     try:
         from hermes_cli.config import cfg_get, load_config
 
         config = load_config()
         entry = cfg_get(config, "plugins", "entries", CONFIG_NAMESPACE, default={})
-        return entry if isinstance(entry, dict) else {}
+        top = cfg_get(config, CONFIG_NAMESPACE, default={})
+        merged: dict = {}
+        if isinstance(entry, dict):
+            merged.update(entry)
+        if isinstance(top, dict):
+            merged.update(top)
+        return merged
     except Exception as exc:  # never block load on config read
         logger.debug("hermes-mpm: config read skipped: %s", exc)
         return {}
 
 
-def _make_pre_gateway_dispatch(cfg: dict):
-    """Compose intent (text rewrite) then routing (model pin) into one handler.
+def _make_pre_llm_call(cfg: dict):
+    """Compose intent (short-circuit) then routing (model swap) into one handler.
 
-    Why: The gateway iterates pre_gateway_dispatch results and ``break``s on the
-    first rewrite/allow/skip — so a separately-registered routing hook could be
-    skipped whenever intent rewrites. Composing them guarantees BOTH run: intent
-    decides the rewrite, routing always pins the tier (a side-effect on the
-    gateway session, not a returned value). They don't conflict — intent
-    rewrites ``event.text``; routing sets the session model.
-    What: Returns ``handler(event, gateway, session_store, agent_id=None,
-    **kw)`` that runs the routing side-effect first (so the tier is pinned even
-    when intent short-circuits the LLM is moot, but when intent does NOT match
-    the agent runs on the routed tier), then returns intent's decision. Routing
-    errors are swallowed inside its own handler.
-    Test: with a weather event -> returns the /weather rewrite AND routing ran;
-    with unrelated text -> returns None and routing pinned a tier.
+    Why: The engine traverses ALL ``pre_llm_call`` results, but the two
+    capabilities have a strict precedence: a deterministic intent answer
+    (``{"final_response"}``) makes any model swap moot, so intent must win when it
+    matches. Composing them into one registered callback keeps that precedence
+    explicit and avoids relying on hook-ordering. Both surfaces (gateway/TUI/
+    dashboard) traverse pre_llm_call now, so this single handler unifies routing
+    across every surface — no separate pre_gateway_dispatch path, no
+    double-routing.
+    What: Returns ``handler(**kw)`` that first runs intent; if intent returns a
+    ``{"final_response"}`` it is returned immediately (turn short-circuits, no
+    LLM). Otherwise it returns routing's model bundle (or None to defer). Each
+    sub-handler swallows its own errors.
+    Test: weather text -> intent's {"final_response"}; "implement …" -> routing's
+    model bundle; unrelated short prose -> None or the default-tier bundle.
     """
-    routing_handler = routing.make_dispatch_handler(cfg)
+    routing_handler = routing.make_pre_llm_call_handler(cfg)
 
-    def composed(event=None, gateway=None, session_store=None, agent_id=None, **kw):
-        # Routing first: pin the tier as a session side-effect (returns None).
-        # If intent then rewrites to a slash command, the deterministic handler
-        # answers in-process and the pinned model is simply unused that turn —
-        # harmless. If intent does NOT match, the agent runs on the routed tier.
+    def composed(**kw):
+        # Intent first: a deterministic answer short-circuits the turn, which
+        # makes any model swap irrelevant — so return it immediately.
         try:
-            routing_handler(
-                event=event,
-                gateway=gateway,
-                session_store=session_store,
-                agent_id=agent_id,
-                **kw,
-            )
-        except Exception as exc:  # never break dispatch
-            logger.debug("hermes-mpm: routing side-effect error (ignored): %s", exc)
-        return intent.pre_gateway_dispatch(
-            event=event,
-            gateway=gateway,
-            session_store=session_store,
-            agent_id=agent_id,
-            **kw,
-        )
+            answer = intent.pre_llm_call(**kw)
+            if answer is not None:
+                return answer
+        except Exception as exc:  # never break the turn
+            logger.debug("hermes-mpm: intent pre_llm_call error (ignored): %s", exc)
+        # No intent match → let routing pick the tier's model bundle (or None).
+        try:
+            return routing_handler(**kw)
+        except Exception as exc:  # never break the turn
+            logger.debug("hermes-mpm: routing pre_llm_call error (ignored): %s", exc)
+            return None
 
-    composed.__name__ = "hermes_mpm_pre_gateway_dispatch"
+    composed.__name__ = "hermes_mpm_pre_llm_call"
     return composed
 
 
@@ -97,11 +104,11 @@ def register(ctx) -> None:
     Why: One hub so the host's PluginManager has a single register() to call;
     per-capability try/except keeps a single bad hook from failing the whole
     plugin on older cores.
-    What: Registers the ``mpm`` CLI command, the composed pre_gateway_dispatch
-    (intent fast-paths + tier routing), the four intent slash commands, the
-    orchestrate tool (real parallel fan-out), and the PM skill.
+    What: Registers the ``mpm`` CLI command, the composed pre_llm_call
+    (intent short-circuit + cross-surface tier routing), the four intent slash
+    commands, the orchestrate tool (real parallel fan-out), and the PM skill.
     Test: Run against a fake ctx and assert the CLI command, the
-    pre_gateway_dispatch hook, the orchestrate tool, the skill, and the four
+    pre_llm_call hook, the orchestrate tool, the skill, and the four
     intent commands were all registered.
     """
     cfg = _read_config(ctx)
@@ -128,11 +135,14 @@ def register(ctx) -> None:
     except Exception as exc:
         logger.warning("hermes-mpm: CLI command registration failed: %s", exc)
 
-    # 2) pre_gateway_dispatch — composed intent fast-paths + tier routing.
+    # 2) pre_llm_call — composed intent short-circuit + cross-surface tier routing.
+    #    Runs on every surface (gateway/TUI/dashboard); no pre_gateway_dispatch
+    #    handler is registered (the gateway also traverses pre_llm_call now, so a
+    #    second seam would double-route).
     try:
-        ctx.register_hook("pre_gateway_dispatch", _make_pre_gateway_dispatch(cfg))
+        ctx.register_hook("pre_llm_call", _make_pre_llm_call(cfg))
     except Exception as exc:
-        logger.debug("hermes-mpm: pre_gateway_dispatch hook skipped: %s", exc)
+        logger.debug("hermes-mpm: pre_llm_call hook skipped: %s", exc)
 
     # 2b) Intent slash commands the rewrites resolve to (no LLM).
     for _name, _handler, _desc, _hint in (
@@ -208,4 +218,4 @@ def register(ctx) -> None:
         # so the operator sees it even with WARNING-filtered log configs.
         logger.error("hermes-mpm: review gate registration failed: %s", exc)
 
-    logger.info("hermes-mpm registered: mpm CLI + pre_gateway_dispatch + orchestrate tool + skill")
+    logger.info("hermes-mpm registered: mpm CLI + pre_llm_call + orchestrate tool + skill")

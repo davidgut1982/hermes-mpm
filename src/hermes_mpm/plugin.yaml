@@ -23,6 +23,6 @@ provides_commands:
   - diskfree
   - svcstatus
 provides_hooks:
-  - pre_gateway_dispatch
+  - pre_llm_call
 provides_skills:
   - pm_orchestrator

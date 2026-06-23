@@ -62,7 +62,9 @@ def test_register_runs_clean_and_wires_all_capabilities():
     hermes_mpm.register(ctx)
 
     assert ctx.cli_commands == ["mpm"]
-    assert "pre_gateway_dispatch" in ctx.hooks
+    # Routing + intent now register on the cross-surface pre_llm_call seam.
+    assert "pre_llm_call" in ctx.hooks
+    assert "pre_gateway_dispatch" not in ctx.hooks
     assert orchestrator.TOOL_NAME in ctx.tools
     assert "pm_orchestrator" in ctx.skills
     # The four intent slash commands the rewrites resolve to.
@@ -102,3 +104,29 @@ def test_orchestrate_validates_required_args():
 
     empty = json.loads(orchestrator.handle({"goal": "g", "subtasks": []}))
     assert "error" in empty
+
+
+def test_read_config_merges_top_level_and_entry(monkeypatch, tmp_path):
+    """_read_config must merge top-level hermes_mpm (routing) over the entry
+    block (gate), so routing sees its tiers and the gate keeps review_gate."""
+    import yaml as _yaml
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(_yaml.safe_dump({
+        "hermes_mpm": {
+            "tiers": {"strong": {"model": "glm-5.2"}, "main": {"model": "glm-4.7"}},
+            "openrouter": {"provider": "zai"},
+        },
+        "plugins": {"entries": {"hermes_mpm": {
+            "review_gate": {"enabled": True},
+            "tiers": {"main": {"model": "old"}},
+        }}},
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    cfg = hermes_mpm._read_config(object())
+    # Top-level routing tiers win (strong present, main overwritten).
+    assert cfg["tiers"]["strong"]["model"] == "glm-5.2"
+    assert cfg["tiers"]["main"]["model"] == "glm-4.7"
+    assert cfg["openrouter"]["provider"] == "zai"
+    # Entry-scoped gate config preserved.
+    assert cfg["review_gate"]["enabled"] is True

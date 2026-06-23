@@ -4,16 +4,18 @@ Why: Some requests are fully answerable without an LLM — weather, time/date,
 disk-free, service-status. Routing them to a stdlib/HTTP handler instead of an
 agent loop is the biggest latency+cost win. This module ports the proven
 weather-deterministic and intent-handlers-core matchers into one place: a
-``pre_gateway_dispatch`` handler that rewrites a matching plain-text message into
-its namespaced slash command (``/weather``, ``/time``, ``/diskfree``,
-``/svcstatus``), which the registered command then answers in-process.
+``pre_llm_call`` handler that matches a plain-text message, EXECUTES the
+corresponding command core in-process (``/weather``, ``/time``, ``/diskfree``,
+``/svcstatus``), and returns the engine's short-circuit bundle
+(``{"final_response"}`` → api_calls == 0). It runs on every surface
+(gateway/TUI/dashboard) identically.
 
 What: ``match_intent(text)`` is a pure matcher returning a rewrite dict or None.
-``pre_gateway_dispatch(event, ...)`` applies it to ``event.text`` (skipping
-existing slash commands). The four slash commands call deterministic cores:
-weather (Open-Meteo, stdlib HTTP) and time (stdlib clock) always answer; disk
-and service call cluster-ops only when ``CLUSTER_OPS_URL``/``CLUSTER_OPS_TOKEN``
-are set, else return None and the gateway falls through to the agent.
+``pre_llm_call(**kw)`` reads ``user_message``, matches, runs the command, and
+returns ``{"final_response": <answer>}`` or None. The four slash commands call
+deterministic cores: weather (Open-Meteo, stdlib HTTP) and time (stdlib clock)
+always answer; disk and service call cluster-ops only when ``CLUSTER_OPS_URL``/
+``CLUSTER_OPS_TOKEN`` are set, else return None and the turn proceeds to the LLM.
 
 Test: match_intent("what's the weather in Chicago") -> rewrite to "/weather
 Chicago"; "what time is it" -> "/time …"; "disk usage" -> "/diskfree"; "is the
@@ -36,6 +38,16 @@ except ImportError:  # pragma: no cover
 
 TIMEZONE = "America/Chicago"
 _HOST = "hermes"
+
+# Intent slash-command -> command handler name (resolved via module globals at
+# call time so the pre_llm_call short-circuit and the registered commands share
+# one source of truth, and tests can monkeypatch a handler).
+_COMMAND_DISPATCH = {
+    "weather": "weather_command",
+    "time": "time_command",
+    "diskfree": "diskfree_command",
+    "svcstatus": "svcstatus_command",
+}
 
 
 # ── Weather matcher (ported from weather-deterministic) ─────────────────────
@@ -254,7 +266,7 @@ def is_service_intent(text: str) -> bool:
     return bool(text and text.strip() and parse_unit(text) is not None)
 
 
-# ── Intent matcher + pre_gateway_dispatch handler ───────────────────────────
+# ── Intent matcher + pre_llm_call short-circuit handler ─────────────────────
 
 
 def match_intent(text: str) -> Optional[dict]:
@@ -290,20 +302,47 @@ def match_intent(text: str) -> Optional[dict]:
     return None
 
 
-def pre_gateway_dispatch(event=None, gateway=None, session_store=None, agent_id=None, **_kw):
-    """Rewrite plain-text deterministic intents to their slash command.
+def pre_llm_call(**kw):
+    """Execute a deterministic intent in-process and short-circuit the turn.
 
-    Why: Short-circuits weather/time/disk/svc to in-process handlers — no LLM.
-    What: Reads ``event.text``, runs ``match_intent``, returns its rewrite dict
-    or None. Any error defers (returns None) so dispatch never breaks.
-    Test: event with weather text -> rewrite dict; event with unrelated text ->
-    None.
+    Why: Weather/time/disk/svc are fully answerable with no LLM. Running on the
+    cross-surface ``pre_llm_call`` seam, this handler answers them identically on
+    gateway/TUI/dashboard and returns the engine's short-circuit bundle
+    (``{"final_response"}`` → api_calls == 0).
+    What: Reads ``user_message`` from kwargs, matches an intent, then EXECUTES the
+    corresponding command core in-process (weather/time/diskfree/svcstatus). On a
+    non-None answer returns ``{"final_response": <answer>}``; if the command
+    returns None (e.g. cluster-ops unavailable) or nothing matched, returns None
+    so the turn proceeds to the LLM. Any error defers (returns None).
+    Test: "what time is it" -> {"final_response": "It is …"}; weather (stubbed
+    core) -> {"final_response": …}; unrelated prose -> None; a command returning
+    None -> None.
     """
     try:
-        text = getattr(event, "text", "") or ""
-    except Exception:
+        text = kw.get("user_message") or ""
+        if not isinstance(text, str):
+            return None
+        decision = match_intent(text)
+        if not decision:
+            return None
+        rewrite = decision.get("text") or ""
+        parts = rewrite.split(None, 1)
+        cmd = parts[0].lstrip("/") if parts else ""
+        raw_args = parts[1] if len(parts) > 1 else ""
+        # Resolve the command via module globals so test monkeypatches of e.g.
+        # ``intent.diskfree_command`` are honored, and the dispatch stays in sync
+        # with the actual command handlers (single source of truth).
+        handler_name = _COMMAND_DISPATCH.get(cmd)
+        handler = globals().get(handler_name) if handler_name else None
+        if handler is None:
+            return None
+        answer = handler(raw_args)
+        if answer is None:
+            return None
+        return {"final_response": answer}
+    except Exception as exc:  # never break the turn
+        logger.debug("hermes-mpm intent pre_llm_call error (deferring): %s", exc)
         return None
-    return match_intent(text)
 
 
 # ── Slash-command handlers (sync: fn(raw_args) -> str | None) ───────────────

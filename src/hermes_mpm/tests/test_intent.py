@@ -1,10 +1,12 @@
-"""Intent fast-path matcher tests for hermes-mpm.
+"""Intent fast-path matcher + pre_llm_call short-circuit tests for hermes-mpm.
 
 Why: The intent matcher decides which messages skip the LLM entirely. A false
 positive hijacks a real request; a false negative wastes a model call. These
-tests pin the four ported matchers (weather/time/disk/svc) and the strict
-fall-through on unrelated prose.
-What: Drives match_intent (pure, no event/gateway) and answer_time (stdlib).
+tests pin the four ported matchers (weather/time/disk/svc), the strict
+fall-through on unrelated prose, and the new ``pre_llm_call`` handler that
+EXECUTES the matched command in-process and returns ``{"final_response": …}``
+(api_calls == 0 on the engine side).
+What: Drives match_intent (pure) and the pre_llm_call handler (executes cores).
 Test: this file — run pytest.
 """
 
@@ -89,16 +91,42 @@ def test_answer_time_is_self_contained():
     )
 
 
-def test_pre_gateway_dispatch_matches_event():
-    class _E:
-        text = "what's the weather in Boston"
+# ── pre_llm_call short-circuit: executes the command in-process ──────────────
 
-    assert intent.pre_gateway_dispatch(event=_E()) == {
-        "action": "rewrite",
-        "text": "/weather Boston",
-    }
 
-    class _E2:
-        text = "let's chat about something"
+def test_pre_llm_call_time_returns_final_response():
+    """A time question executes time_command in-process → {final_response}."""
+    out = intent.pre_llm_call(user_message="what time is it")
+    assert isinstance(out, dict)
+    assert "final_response" in out
+    assert ":" in out["final_response"]  # rendered clock time
 
-    assert intent.pre_gateway_dispatch(event=_E2()) is None
+
+def test_pre_llm_call_weather_executes_in_process(monkeypatch):
+    """Weather executes weather_command (stub the core so no network)."""
+    from hermes_mpm import weather_core
+
+    monkeypatch.setattr(
+        weather_core, "answer_weather",
+        lambda **kw: "Chicago: 72F, clear.",
+    )
+    out = intent.pre_llm_call(user_message="what's the weather in Chicago")
+    assert out == {"final_response": "Chicago: 72F, clear."}
+
+
+def test_pre_llm_call_unrelated_returns_none():
+    """Non-intent prose must NOT short-circuit (proceeds to the LLM)."""
+    assert intent.pre_llm_call(user_message="summarize this document for me") is None
+    assert intent.pre_llm_call(user_message="schedule a meeting for tomorrow") is None
+
+
+def test_pre_llm_call_command_none_falls_through(monkeypatch):
+    """If the matched command returns None (e.g. cluster-ops down), defer."""
+    # diskfree depends on cluster-ops; force it to return None.
+    monkeypatch.setattr(intent, "diskfree_command", lambda raw: None)
+    out = intent.pre_llm_call(user_message="disk usage")
+    assert out is None
+
+
+def test_pre_llm_call_slash_passthrough_returns_none():
+    assert intent.pre_llm_call(user_message="/weather Chicago") is None

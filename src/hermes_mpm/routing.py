@@ -6,20 +6,22 @@ that can do the job — free 70B for background/bulk, a cheap workhorse for simp
 interactive turns, the main reasoning model by default, a strong model for
 engineering, and the max model only on explicit demand. This is done with a
 pure-Python deterministic classifier (zero extra LLM calls) plus a
-``pre_gateway_dispatch`` handler that pins the chosen tier's model onto the
-gateway session before the agent is built.
+``pre_llm_call`` handler that RETURNS the chosen tier's complete model bundle so
+the engine swaps the model before the first LLM call — on every surface
+(gateway, TUI, dashboard) identically, with no gateway-internal coupling.
 
 What: ``classify(text, platform, profile)`` is a pure function returning
-``(grouping, tier)``. ``make_dispatch_handler(config, ...)`` builds the
-``pre_gateway_dispatch`` callback that classifies the event, resolves the tier's
-provider bundle, writes a COMPLETE session override into the gateway's
-``_session_model_overrides`` dict (so it supersedes any profile-pinned model),
-evicts the cached agent, and returns None (never rewrites text).
+``(grouping, tier)``. ``make_pre_llm_call_handler(config)`` builds the
+``pre_llm_call`` callback that reads ``user_message``/``platform``/``model`` from
+kwargs, classifies the request, resolves the tier's provider bundle, and RETURNS
+``{model, provider, api_key, base_url, api_mode}`` (or None to defer). It honors
+an operator's manual ``/model`` pin (a live model the tiers would never produce)
+by returning None.
 
 Test: ``classify("is plex up?", "telegram")`` -> ("interactive_simple",
 "cheap_workhorse"); ``classify("implement retry backoff", "telegram")`` ->
 ("engineering", "strong"); ``classify("x", "cron")`` -> background/free; the
-dispatch handler writes the right override dict (see test_routing.py).
+handler returns the right bundle dict (see test_routing.py).
 """
 
 from __future__ import annotations
@@ -228,11 +230,16 @@ def resolve_tier_override(
     bundle (no api_key) would only layer model/provider on top of env
     resolution and could lose to the profile.
     What: Reads the tier's model from config (falling back to DEFAULT_TIERS) and
-    the openrouter provider creds (api_key from config or ``OPENROUTER_API_KEY``
-    env). Returns ``{model, provider, api_key, base_url, api_mode}`` or None when
-    no api_key is resolvable (so we never write a half-override that loses).
+    the shared ``openrouter`` provider creds (api_key from config or
+    ``OPENROUTER_API_KEY`` env). A tier may override the provider per-tier (its
+    own ``provider``/``base_url``/``api_key``/``api_key_env``) — needed when most
+    tiers run on one endpoint (e.g. z.ai coding) but ``free_background`` runs on
+    OpenRouter's ``:free`` pool. Returns ``{model, provider, api_key, base_url,
+    api_mode}`` or None when no api_key is resolvable (so we never write a
+    half-override that loses).
     Test: with OPENROUTER_API_KEY set, resolve_tier_override("main", {}) returns
-    a dict whose model == deepseek-v4-flash and api_key is non-empty.
+    a dict whose model == deepseek-v4-flash and api_key is non-empty; a tier with
+    its own ``base_url`` overrides the shared one.
     """
     tiers = {**DEFAULT_TIERS, **(config.get("tiers") or {})}
     tier_cfg = tiers.get(tier)
@@ -243,7 +250,21 @@ def resolve_tier_override(
     if not model:
         return None
 
-    provider_cfg = (config.get("openrouter") or {}) if isinstance(config, dict) else {}
+    # Per-tier provider override merged over the shared openrouter block, so a
+    # single tier (free_background) can target a different endpoint/creds.
+    shared_cfg = (config.get("openrouter") or {}) if isinstance(config, dict) else {}
+    _tier_provider = {
+        k: tier_cfg[k]
+        for k in ("provider", "base_url", "api_key", "api_key_env", "api_mode")
+        if k in tier_cfg
+    }
+    provider_cfg = {**shared_cfg, **_tier_provider}
+    # If the tier redirects creds (its own api_key_env/api_key) but not the raw
+    # api_key, drop the shared block's inherited api_key so the tier's
+    # api_key_env env lookup wins instead of the wrong (shared) key.
+    if ("api_key_env" in _tier_provider or "provider" in _tier_provider) and \
+            "api_key" not in _tier_provider:
+        provider_cfg.pop("api_key", None)
     api_key = (
         provider_cfg.get("api_key")
         or os.environ.get(provider_cfg.get("api_key_env") or OPENROUTER_API_KEY_ENV)
@@ -268,40 +289,69 @@ def resolve_tier_override(
 def _platform_enabled(config: Dict[str, Any], platform: str) -> bool:
     """Return whether routing should fire for *platform*.
 
-    Why: CLI is opt-out by default (operators expect their pinned local model
-    when running ``hermes chat``); telegram/api/cron are the live surfaces.
-    What: Reads ``platforms.<platform>.enabled``; CLI/local default False, all
-    other platforms default True.
-    Test: _platform_enabled({}, "local") is False; _platform_enabled({},
-    "telegram") is True; explicit enabled flag overrides the default.
+    Why: Cross-surface unification — telegram, the TUI (``hermes chat``) and the
+    dashboard must all get the SAME tiered-routing experience (David's call). The
+    only opt-out default is a bare ``cli``/``local`` invocation, where an operator
+    running a one-off command expects their pinned local model (a manual
+    ``/model`` is still honored everywhere).
+    What: Reads ``platforms.<platform>.enabled``; ``cli``/``local`` default False,
+    every other platform (telegram, api*, cron, **tui**, **dashboard**) defaults
+    True. An explicit ``enabled`` flag always overrides the default.
+    Test: _platform_enabled({}, "tui") is True; _platform_enabled({}, "dashboard")
+    is True; _platform_enabled({}, "cli") is False; an explicit flag overrides.
     """
     platforms = config.get("platforms") or {}
     plat = (platform or "").lower()
-    # Normalise CLI aliases.
+    # Normalise CLI aliases (bare local invocation), but NOT tui/dashboard —
+    # those route like telegram per the cross-surface decision.
     key = "cli" if plat in ("cli", "local") else plat
     entry = platforms.get(key)
     if isinstance(entry, dict) and "enabled" in entry:
         return bool(entry["enabled"])
-    # Default: CLI/local off, everything else on.
+    # Default: only a bare cli/local invocation opts out; all else routes.
     return key != "cli"
 
 
-def make_dispatch_handler(
+def _known_tier_models(config: Dict[str, Any]) -> frozenset:
+    """All model ids the routing tiers can produce (for manual-pin detection).
+
+    Why: On the pre_llm_call seam there is no gateway session to inspect, so we
+    detect an operator's manual ``/model`` by its model id: if the live model is
+    NOT one this plugin would ever route to, the operator pinned it — defer.
+    What: Returns the set of tier ``model`` strings + their fallbacks (config
+    overrides ∪ defaults).
+    Test: with default config it contains DEFAULT_TIERS[main]['model'] and not a
+    foreign model like 'anthropic/claude-opus-4.6'.
+    """
+    tiers = {**DEFAULT_TIERS, **((config or {}).get("tiers") or {})}
+    models = set()
+    for spec in tiers.values():
+        if isinstance(spec, dict) and spec.get("model"):
+            models.add(spec["model"])
+            for fb in spec.get("fallbacks") or []:
+                models.add(fb)
+    return frozenset(models)
+
+
+def make_pre_llm_call_handler(
     config: Optional[Dict[str, Any]] = None,
-) -> Callable[..., None]:
-    """Build the ``pre_gateway_dispatch`` routing handler bound to *config*.
+) -> Callable[..., Optional[Dict[str, Any]]]:
+    """Build the ``pre_llm_call`` routing handler bound to *config*.
 
     Why: The handler needs the resolved config (tiers, profile map, creds) at
     registration time; a closure keeps that state without globals and stays
-    unit-testable (you can build one with a fake config).
-    What: Returns ``handler(event, gateway, session_store, agent_id=None,
-    **kw)`` that classifies the event, resolves the tier override, writes it
-    into ``gateway._session_model_overrides[session_key]``, evicts the cached
-    agent, and returns None. Respects platform gating and an existing manual
-    ``/model`` override. Any error is logged and swallowed (never breaks
-    dispatch).
-    Test: build with a fake config + OPENROUTER_API_KEY; call with a fake
-    gateway/event; assert the override dict was written and eviction called.
+    unit-testable. Running on ``pre_llm_call`` (not ``pre_gateway_dispatch``)
+    means the SAME handler routes every surface — gateway, TUI, dashboard — with
+    no gateway-internal coupling (no session-override map, no agent eviction).
+    What: Returns ``handler(**kw)`` that reads ``user_message``/``platform``/
+    ``model`` from kwargs, gates by platform, defers to an operator's manual
+    ``/model`` pin (a live model the tiers would never produce), classifies the
+    request, resolves the tier bundle, and RETURNS
+    ``{model, provider, api_key, base_url, api_mode}`` — or None to defer. The
+    engine applies the bundle via switch_model. Any error is logged and
+    swallowed (returns None → the turn proceeds on the profile model).
+    Test: build with a fake config + OPENROUTER_API_KEY; assert the returned
+    bundle for an engineering message, and None for a manual pin / cli / no-key.
     """
     cfg = config or {}
     profile_tier_map = cfg.get("profile_tier_map") or DEFAULT_PROFILE_TIER_MAP
@@ -309,128 +359,61 @@ def make_dispatch_handler(
     complexity_keywords = cfg.get("complexity_keywords") or DEFAULT_COMPLEXITY_KEYWORDS
     simple_keywords = cfg.get("simple_keywords") or DEFAULT_SIMPLE_KEYWORDS
     bulk_profiles = frozenset(cfg.get("bulk_profiles") or DEFAULT_BULK_PROFILES)
+    known_models = _known_tier_models(cfg)
 
-    def handler(event=None, gateway=None, session_store=None, agent_id=None, **_kw):
+    def handler(**kw) -> Optional[Dict[str, Any]]:
         try:
-            return _route(
-                event=event,
-                gateway=gateway,
-                cfg=cfg,
+            text = (kw.get("user_message") or "")
+            text = text.strip() if isinstance(text, str) else ""
+            platform = (kw.get("platform") or "").lower()
+            current_model = kw.get("model") or ""
+            profile = kw.get("profile")
+            urgency = kw.get("urgency")
+
+            if not text:
+                return None
+            if not _platform_enabled(cfg, platform):
+                logger.debug("hermes-mpm routing: platform %r opted out", platform)
+                return None
+
+            # Manual-pin precedence: if the live model is one the operator pinned
+            # (a model the tiers would never produce), defer to it.
+            if current_model and current_model not in known_models:
+                logger.debug(
+                    "hermes-mpm routing: live model %r is operator-pinned; deferring",
+                    current_model,
+                )
+                return None
+
+            grouping, tier = classify(
+                text,
+                platform=platform,
+                profile=profile,
+                urgency=urgency,
                 profile_tier_map=profile_tier_map,
-                thresholds=thresholds,
                 complexity_keywords=complexity_keywords,
                 simple_keywords=simple_keywords,
                 bulk_profiles=bulk_profiles,
+                thresholds=thresholds,
             )
-        except Exception as exc:  # never break dispatch
+
+            bundle = resolve_tier_override(tier, cfg)
+            if bundle is None:
+                return None
+
+            # Idempotent: if the resolved tier model already matches the live
+            # model, there's nothing to swap — let the turn proceed unchanged.
+            if current_model and bundle["model"] == current_model:
+                return None
+
+            logger.info(
+                "hermes-mpm routing: %s/%s -> tier=%s model=%s",
+                platform or "?", grouping, tier, bundle["model"],
+            )
+            return bundle
+        except Exception as exc:  # never break the turn
             logger.warning("hermes-mpm routing handler error (ignored): %s", exc)
             return None
 
-    handler.__name__ = "hermes_mpm_routing_dispatch"
+    handler.__name__ = "hermes_mpm_routing_pre_llm_call"
     return handler
-
-
-def _event_platform(event) -> str:
-    """Best-effort platform string from an event/source."""
-    source = getattr(event, "source", None)
-    plat = getattr(source, "platform", None) or getattr(event, "platform", None)
-    value = getattr(plat, "value", None)
-    return str(value if value is not None else plat or "").lower()
-
-
-def _route(
-    *,
-    event,
-    gateway,
-    cfg: Dict[str, Any],
-    profile_tier_map: Dict[str, str],
-    thresholds: Dict[str, int],
-    complexity_keywords,
-    simple_keywords,
-    bulk_profiles,
-) -> None:
-    """Core routing logic (separated so make_dispatch_handler can wrap errors).
-
-    Why: Keeps the try/except wrapper thin and the testable logic explicit.
-    What: classify → gate by platform → respect manual override → resolve tier
-    bundle → write override + evict. Returns None always (no text rewrite).
-    Test: covered via the handler in test_routing.py.
-    """
-    text = (getattr(event, "text", "") or "").strip()
-    platform = _event_platform(event)
-    urgency = getattr(event, "urgency", None)
-    source = getattr(event, "source", None)
-    profile = getattr(source, "profile", None) or getattr(event, "profile", None)
-
-    if not text:
-        return None
-    if not _platform_enabled(cfg, platform):
-        logger.debug("hermes-mpm routing: platform %r opted out", platform)
-        return None
-
-    grouping, tier = classify(
-        text,
-        platform=platform,
-        profile=profile,
-        urgency=urgency,
-        profile_tier_map=profile_tier_map,
-        complexity_keywords=complexity_keywords,
-        simple_keywords=simple_keywords,
-        bulk_profiles=bulk_profiles,
-        thresholds=thresholds,
-    )
-
-    if gateway is None:
-        logger.debug("hermes-mpm routing: no gateway; tier=%s (dry)", tier)
-        return None
-
-    # Compute the session key the gateway will resolve for this source.
-    try:
-        session_key = gateway._session_key_for_source(source)
-    except Exception as exc:
-        logger.debug("hermes-mpm routing: session key resolve failed: %s", exc)
-        return None
-    if not session_key:
-        return None
-
-    overrides = getattr(gateway, "_session_model_overrides", None)
-    if overrides is None:
-        return None
-
-    # Respect a manual /model override already in place — don't stomp it.
-    # We mark our own writes with a sentinel so we may re-route across turns
-    # but never clobber an operator's explicit /model.
-    existing = overrides.get(session_key)
-    if isinstance(existing, dict) and not existing.get("_hermes_mpm"):
-        logger.debug(
-            "hermes-mpm routing: manual /model override present on %s; deferring",
-            session_key,
-        )
-        return None
-
-    bundle = resolve_tier_override(tier, cfg)
-    if bundle is None:
-        return None
-
-    # Idempotent: skip the write+evict if the same model is already pinned by us.
-    if isinstance(existing, dict) and existing.get("model") == bundle["model"]:
-        return None
-
-    bundle = {**bundle, "_hermes_mpm": True, "_hermes_mpm_tier": tier}
-    overrides[session_key] = bundle
-    logger.info(
-        "hermes-mpm routing: %s/%s -> tier=%s model=%s session=%s",
-        platform or "?",
-        grouping,
-        tier,
-        bundle["model"],
-        session_key,
-    )
-
-    # Evict the cached agent so the next build picks up the new model.
-    try:
-        gateway._evict_cached_agent(session_key)
-    except Exception as exc:
-        logger.debug("hermes-mpm routing: evict failed (non-fatal): %s", exc)
-
-    return None
