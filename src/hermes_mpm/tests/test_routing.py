@@ -227,3 +227,87 @@ def test_handler_errors_are_swallowed(monkeypatch):
 
     monkeypatch.setattr(routing, "classify", _boom)
     assert handler(user_message="implement", platform="telegram", model="x") is None
+
+
+def test_tier_base_url_only_to_different_host_drops_shared_api_key(monkeypatch):
+    """A tier that overrides ONLY base_url to a different host must NOT inherit
+    the shared api_key.
+
+    Why: the shared block holds the OpenRouter key. If a tier redirects only its
+    ``base_url`` to a different auth domain (no provider/api_key/api_key_env of
+    its own), the old guard left the shared key in place — sending the
+    OpenRouter credential to a foreign endpoint (credential leak / 401). The
+    tier must instead supply its own key (here, via env at apply time); the
+    bundle must not carry the wrong shared key.
+    Test: tier 'strong' sets only a z.ai base_url; assert the resolved bundle
+    does NOT send 'sk-or-shared'.
+    """
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    config = {
+        "openrouter": {
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-or-shared",
+        },
+        "tiers": {
+            # Only base_url overridden → DIFFERENT host than the shared block.
+            "strong": {
+                "model": "glm-5.2",
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+            },
+        },
+    }
+    strong = routing.resolve_tier_override("strong", config)
+    # With no resolvable key for the foreign host, the override is skipped
+    # entirely (None) rather than leaking the shared OpenRouter key.
+    if strong is not None:
+        assert strong["api_key"] != "sk-or-shared", (
+            "shared OpenRouter key leaked to a different-host base_url"
+        )
+        assert strong["base_url"] == "https://api.z.ai/api/coding/paas/v4"
+
+
+def test_tier_base_url_only_different_host_uses_own_env_key(monkeypatch):
+    """When the tier redirects base_url to a different host AND provides its own
+    api_key_env, that env key is used — never the shared OpenRouter key."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-shared")
+    monkeypatch.setenv("ZAI_API_KEY", "sk-zai-own")
+    config = {
+        "openrouter": {
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-or-shared",
+        },
+        "tiers": {
+            "strong": {
+                "model": "glm-5.2",
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+                "api_key_env": "ZAI_API_KEY",
+            },
+        },
+    }
+    strong = routing.resolve_tier_override("strong", config)
+    assert strong is not None
+    assert strong["base_url"] == "https://api.z.ai/api/coding/paas/v4"
+    assert strong["api_key"] == "sk-zai-own"
+
+
+def test_tier_same_host_base_url_override_keeps_shared_key(monkeypatch):
+    """A same-host base_url override (e.g. path tweak) must KEEP the shared key —
+    current behavior is preserved for same auth domain."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-shared")
+    config = {
+        "openrouter": {
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-or-shared",
+        },
+        "tiers": {
+            # SAME host as shared block, different path → key still valid.
+            "strong": {
+                "model": "glm-5.2",
+                "base_url": "https://openrouter.ai/api/v1/beta",
+            },
+        },
+    }
+    strong = routing.resolve_tier_override("strong", config)
+    assert strong is not None
+    assert strong["base_url"] == "https://openrouter.ai/api/v1/beta"
+    assert strong["api_key"] == "sk-or-shared"

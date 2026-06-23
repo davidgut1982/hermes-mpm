@@ -30,6 +30,28 @@ import logging
 import os
 import re
 from typing import Any, Callable, Dict, Optional, Tuple
+from urllib.parse import urlsplit
+
+
+def _same_host(url_a: str, url_b: str) -> bool:
+    """Return True when two URLs share the same hostname (case-insensitive).
+
+    Why: a per-tier ``base_url`` override that points at a *different* auth
+    domain must not inherit the shared OpenRouter api_key — sending it would
+    leak the credential to a foreign endpoint. Hostname is the right
+    granularity: a same-host path tweak (``/v1`` → ``/v1/beta``) keeps the key;
+    a different host (openrouter.ai → api.z.ai) drops it.
+    What: parses both URLs and compares ``netloc`` hostnames; missing/blank
+    URLs are treated as non-matching (conservative — drop the key).
+    Test: _same_host("https://openrouter.ai/v1", "https://openrouter.ai/v1/beta")
+    is True; ("https://openrouter.ai/v1", "https://api.z.ai/v4") is False.
+    """
+    try:
+        ha = (urlsplit(url_a or "").hostname or "").lower()
+        hb = (urlsplit(url_b or "").hostname or "").lower()
+    except ValueError:
+        return False
+    return bool(ha) and ha == hb
 
 logger = logging.getLogger("hermes_mpm.routing")
 
@@ -262,14 +284,31 @@ def resolve_tier_override(
     # If the tier redirects creds (its own api_key_env/api_key) but not the raw
     # api_key, drop the shared block's inherited api_key so the tier's
     # api_key_env env lookup wins instead of the wrong (shared) key.
-    if ("api_key_env" in _tier_provider or "provider" in _tier_provider) and \
-            "api_key" not in _tier_provider:
+    _redirects_creds = (
+        "api_key_env" in _tier_provider or "provider" in _tier_provider
+    ) and "api_key" not in _tier_provider
+    # Cross-host base_url edge: a tier that overrides ONLY base_url (no
+    # provider/api_key/api_key_env of its own) to a DIFFERENT host must not
+    # inherit the shared OpenRouter key — that would ship the credential to a
+    # foreign auth domain. Force the tier to supply its own creds. Same-host
+    # overrides (path tweaks) keep current behavior.
+    _shared_base = shared_cfg.get("base_url") or OPENROUTER_BASE_URL
+    _foreign_base_url = (
+        "base_url" in _tier_provider
+        and "api_key" not in _tier_provider
+        and not _same_host(_tier_provider["base_url"], _shared_base)
+    )
+    if _redirects_creds or _foreign_base_url:
         provider_cfg.pop("api_key", None)
     api_key = (
         provider_cfg.get("api_key")
         or os.environ.get(provider_cfg.get("api_key_env") or OPENROUTER_API_KEY_ENV)
-        or os.environ.get(OPENROUTER_API_KEY_ENV)
     )
+    # Only fall back to the bare OPENROUTER_API_KEY env when the endpoint is
+    # still an OpenRouter (same-host) endpoint — never for a foreign base_url,
+    # which would leak the OpenRouter key to a different domain.
+    if not api_key and not _foreign_base_url:
+        api_key = os.environ.get(OPENROUTER_API_KEY_ENV)
     if not api_key:
         # No creds → don't write an incomplete override (would risk losing to
         # the profile). Caller logs + falls through.
