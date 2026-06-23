@@ -344,9 +344,11 @@ def make_pre_llm_call_handler(
     means the SAME handler routes every surface — gateway, TUI, dashboard — with
     no gateway-internal coupling (no session-override map, no agent eviction).
     What: Returns ``handler(**kw)`` that reads ``user_message``/``platform``/
-    ``model`` from kwargs, gates by platform, defers to an operator's manual
-    ``/model`` pin (a live model the tiers would never produce), classifies the
-    request, resolves the tier bundle, and RETURNS
+    ``model``/``agent`` from kwargs, gates by platform, defers to an operator's
+    manual ``/model`` pin (the durable ``agent._user_model_pin`` flag the
+    surface sets, with a name heuristic as fallback — so a pin survives even
+    when the pinned model equals a tier model), classifies the request,
+    resolves the tier bundle, and RETURNS
     ``{model, provider, api_key, base_url, api_mode}`` — or None to defer. The
     engine applies the bundle via switch_model. Any error is logged and
     swallowed (returns None → the turn proceeds on the profile model).
@@ -369,6 +371,7 @@ def make_pre_llm_call_handler(
             current_model = kw.get("model") or ""
             profile = kw.get("profile")
             urgency = kw.get("urgency")
+            agent = kw.get("agent")
 
             if not text:
                 return None
@@ -376,8 +379,22 @@ def make_pre_llm_call_handler(
                 logger.debug("hermes-mpm routing: platform %r opted out", platform)
                 return None
 
-            # Manual-pin precedence: if the live model is one the operator pinned
-            # (a model the tiers would never produce), defer to it.
+            # Manual-pin precedence (durable signal): the surface sets
+            # ``agent._user_model_pin`` when the operator pinned a model via
+            # ``/model`` and clears it on a return to auto. This is reliable even
+            # when the pinned model IS one of our tier models (e.g. /model
+            # glm-5.2 == strong tier), which the name heuristic below cannot
+            # distinguish. Defer whenever the explicit pin is set.
+            if getattr(agent, "_user_model_pin", False):
+                logger.debug(
+                    "hermes-mpm routing: user pinned model %r via /model; deferring",
+                    current_model,
+                )
+                return None
+
+            # Secondary heuristic (no agent flag available, e.g. older engine or
+            # a surface that doesn't set it): if the live model is one the tiers
+            # would never produce, treat it as an operator pin and defer.
             if current_model and current_model not in known_models:
                 logger.debug(
                     "hermes-mpm routing: live model %r is operator-pinned; deferring",

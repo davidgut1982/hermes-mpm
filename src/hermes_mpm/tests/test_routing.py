@@ -112,6 +112,51 @@ def test_handler_respects_manual_model_pin(monkeypatch):
     assert out is None  # deferred to the operator's pin
 
 
+def test_handler_user_pin_flag_beats_tier_model(monkeypatch):
+    """Regression (HIGH-2): a ``/model`` pin must win even when the pinned model
+    IS one of the routing tiers (e.g. ``/model glm-5.2`` == strong tier).
+
+    The name heuristic (``model not in known_models``) fails here because the
+    pin equals a tier model. The durable ``agent._user_model_pin`` flag must
+    still force a defer. To isolate the flag from the idempotent same-model
+    short-circuit, the pinned model (strong tier = glm-5.2) is paired with a
+    message that routes to a DIFFERENT tier (main): without the flag routing
+    overrides to main; with the flag it defers.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-123")
+    # glm-5.2 IS the strong tier model → it lives in known_models.
+    cfg = {"tiers": {"strong": {"model": "glm-5.2"}}}
+    handler = routing.make_pre_llm_call_handler(cfg)
+
+    class _Agent:
+        _user_model_pin = False
+
+    agent = _Agent()
+    # "how are you doing today" → main tier (different from strong=glm-5.2).
+    main_model = routing.DEFAULT_TIERS[TIER_MAIN]["model"]
+
+    # No pin: routing is active and overrides the live glm-5.2 → main tier.
+    agent._user_model_pin = False
+    out = handler(
+        user_message="how are you doing today",
+        platform="telegram",
+        model="glm-5.2",
+        agent=agent,
+    )
+    assert out is not None, "without the pin, routing must tier-route normally"
+    assert out["model"] == main_model
+
+    # Pinned: even though glm-5.2 IS a tier model, the flag forces a defer.
+    agent._user_model_pin = True
+    out = handler(
+        user_message="how are you doing today",
+        platform="telegram",
+        model="glm-5.2",
+        agent=agent,
+    )
+    assert out is None, "the user-pin flag must beat tier routing"
+
+
 def test_handler_opts_out_on_cli(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-123")
     handler = routing.make_pre_llm_call_handler({})
