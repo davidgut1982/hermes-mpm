@@ -38,42 +38,56 @@ DELEGATE_TOOL = "delegate_task"
 LEAF_ROLE = "leaf"
 
 ORCHESTRATE_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "goal": {
-            "type": "string",
-            "description": "The overall goal this batch of subtasks serves.",
-        },
-        "subtasks": {
-            "type": "array",
-            "description": (
-                "Subtasks to run IN PARALLEL. Each runs as its own child agent "
-                "under the given profile. Supply 2+ to get fan-out."
-            ),
-            "items": {
-                "type": "object",
-                "properties": {
-                    "profile": {
-                        "type": "string",
-                        "description": "Agent archetype to run this subtask (e.g. 'ops').",
-                    },
-                    "goal": {
-                        "type": "string",
-                        "description": "What this subtask must accomplish.",
-                    },
-                    "context": {
-                        "type": "string",
-                        "description": "Optional extra context for the subtask.",
-                    },
-                },
-                "required": ["profile", "goal"],
-                "additionalProperties": False,
+    # Top-level structure mirrors DELEGATE_TASK_SCHEMA: name + description +
+    # parameters wrapping the JSON schema. registry.get_definitions() does
+    # {**entry.schema, "name": name} → must have "parameters" at this level
+    # or the model sees an empty schema and refuses to call the tool.
+    "name": TOOL_NAME,
+    "description": (
+        "Fan out 2+ INDEPENDENT subtasks to agent profiles IN PARALLEL via one "
+        "batched delegate_task call. Use this instead of looping delegate_task — "
+        "batching lets the native ThreadPoolExecutor run all subtasks concurrently "
+        "so total elapsed ≈ max(child_time) not sum(child_times). "
+        "Call ONCE with all subtasks in the array; do not call per subtask."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "goal": {
+                "type": "string",
+                "description": "The overall goal this batch of subtasks serves.",
             },
-            "minItems": 1,
+            "subtasks": {
+                "type": "array",
+                "description": (
+                    "Subtasks to run IN PARALLEL. Each runs as its own child agent "
+                    "under the given profile. Supply 2+ to get fan-out."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "profile": {
+                            "type": "string",
+                            "description": "Agent archetype to run this subtask (e.g. 'ops').",
+                        },
+                        "goal": {
+                            "type": "string",
+                            "description": "What this subtask must accomplish.",
+                        },
+                        "context": {
+                            "type": "string",
+                            "description": "Optional extra context for the subtask.",
+                        },
+                    },
+                    "required": ["profile", "goal"],
+                    "additionalProperties": False,
+                },
+                "minItems": 1,
+            },
         },
+        "required": ["goal", "subtasks"],
+        "additionalProperties": False,
     },
-    "required": ["goal", "subtasks"],
-    "additionalProperties": False,
 }
 
 
