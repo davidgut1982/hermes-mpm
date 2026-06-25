@@ -5,11 +5,12 @@ description: >-
   Multi-agent profile management (MPM) for Hermes. Tiered model routing (a
   pure-Python deterministic classifier pins the cheapest capable model per
   request), a parallel orchestrator (one batched delegate_task fans subtasks out
-  across the native ThreadPoolExecutor), and deterministic intent fast-paths
-  (weather / time / disk / service-status answered in-process, no LLM). Ships the
-  default set of 22 agent profiles and a `hermes mpm` CLI (list-profiles +
-  routing dry-run). Each capability registers in its own try/except so an unknown
-  hook on an older core never blocks plugin load.
+  across the native ThreadPoolExecutor), deterministic intent fast-paths
+  (weather / time / disk / service-status answered in-process, no LLM), and the
+  6-stage bug-fix pipeline (init → transition → record_evidence → verify_gate →
+  status → recover). Ships the default set of 22 agent profiles and a `hermes mpm`
+  CLI (list-profiles + routing dry-run). Each capability registers in its own
+  try/except so an unknown hook on an older core never blocks plugin load.
 author: hermes-mpm
 entry_point: register
 config_namespace: hermes_mpm
@@ -17,6 +18,12 @@ provides_cli_commands:
   - mpm
 provides_tools:
   - hermes_mpm_orchestrate
+  - pipeline_init
+  - pipeline_transition
+  - pipeline_record_evidence
+  - pipeline_verify_gate
+  - pipeline_status
+  - pipeline_recover
 provides_commands:
   - weather
   - time
