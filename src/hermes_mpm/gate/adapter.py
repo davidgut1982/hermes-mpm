@@ -69,14 +69,24 @@ class ReviewGateAdapter:
 
     # ── seam: block path ────────────────────────────────────────────────────
 
-    def hook_callback(self, function_name: str, function_args: dict, **kwargs) -> str | None:
-        """pre_tool_call hook: block path. Returns a block message, or None to allow."""
-        if function_name != DELEGATE_TOOL:
+    def hook_callback(self, tool_name: str = "", args: dict = None, **kwargs) -> str | None:
+        """pre_tool_call hook: block path. Returns a block message, or None to allow.
+
+        Why: The engine's invoke_hook("pre_tool_call", ...) dispatches with
+        tool_name= and args= as kwargs (see hermes_cli/plugins.py
+        get_pre_tool_call_block_message). The prior signature used function_name/
+        function_args which never matched, so every call raised TypeError and the
+        gate silently crashed on every tool call.
+        What: Accept tool_name/args to match the engine's actual kwarg names.
+        Test: Call hook_callback(tool_name="delegate_task", args={}) — should not
+        raise TypeError and should return a block/None verdict.
+        """
+        if tool_name != DELEGATE_TOOL:
             return None
-        args = function_args or {}
+        function_args = args or {}
         tool_call_id = kwargs.get("tool_call_id")
 
-        verdict = self._get_or_review(tool_call_id, function_name, args)
+        verdict = self._get_or_review(tool_call_id, tool_name, function_args)
         if verdict.decision == "block":
             return f"[review-gate] BLOCKED: {verdict.reason}"
         return None
