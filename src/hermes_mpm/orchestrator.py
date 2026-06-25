@@ -34,6 +34,27 @@ TOOL_NAME = "hermes_mpm_orchestrate"
 # Captured at register() time so the tool handler can reach dispatch_tool.
 _CTX = None
 
+# Agent captured from pre_llm_call hook each turn.
+# pre_llm_call fires before every LLM response, so this is always set
+# before any tool call (including hermes_mpm_orchestrate) in that turn.
+# Plugin-only approach: avoids engine changes to pass parent_agent through
+# the plugin tool dispatch path (which doesn't inject parent_agent).
+_captured_agent = None
+
+
+def capture_agent(agent) -> None:
+    """Store the live AIAgent reference for use in handle().
+
+    Why: The plugin tool dispatch path does not inject parent_agent — only
+    the built-in delegate_task path does. By capturing the agent from the
+    pre_llm_call hook (which always fires before tool calls in the same
+    turn), handle() can inject it when calling delegate_task.
+    What: Sets module global _captured_agent to the provided agent.
+    Test: capture_agent(mock_agent); assert orchestrator._captured_agent is mock_agent.
+    """
+    global _captured_agent
+    _captured_agent = agent
+
 DELEGATE_TOOL = "delegate_task"
 LEAF_ROLE = "leaf"
 
@@ -187,7 +208,18 @@ def handle(args: Dict[str, Any], **_kwargs) -> str:
         len(tasks),
     )
     try:
-        result = _CTX.dispatch_tool(DELEGATE_TOOL, payload)
+        # Resolve parent_agent from the agent captured in pre_llm_call.
+        # pre_llm_call fires before every LLM response, which is always
+        # before any tool call in the same turn, so _captured_agent is
+        # always set when handle() runs.
+        # Fallback chain: captured agent → dispatch_tool (which tries _cli_ref).
+        _parent_agent = _captured_agent
+
+        from tools.registry import registry as _reg
+        if _parent_agent is not None:
+            result = _reg.dispatch(DELEGATE_TOOL, payload, parent_agent=_parent_agent)
+        else:
+            result = _CTX.dispatch_tool(DELEGATE_TOOL, payload)
     except Exception as exc:
         logger.warning("hermes-mpm orchestrate: delegate_task dispatch failed: %s", exc)
         return json.dumps({"error": f"delegate_task dispatch failed: {exc}"})
