@@ -297,6 +297,87 @@ def test_cross_lab_different_lab_normal(tmp_path):
     assert msg is None
 
 
+# ── 4b. FULL REVIEW PATH (line ~89 — the formerly broken path) ──────────────
+# Prior tests only exercised allow/tighten classification after memoization.
+# This suite exercises the hook_callback path cold (no memo hit) for a gated
+# tier, so _get_or_review → _review → _review_one → call_reviewer is traversed
+# end-to-end and verdict is returned — the path that would have raised NameError
+# if function_name still existed.
+
+
+def test_hook_callback_full_review_path_allow(tmp_path):
+    """hook_callback reaches _get_or_review for an elevated (gated) task and returns None on ALLOW.
+
+    Why: This is the exact path that commit 088503e fixed (function_name → tool_name).
+    A cold call (no prior memo) on an elevated task must reach the reviewer, get a
+    verdict, and return None (no block) when the reviewer says ALLOW.
+    What: mock call_reviewer to return 'ALLOW'; call hook_callback cold; assert no
+    NameError is raised, reviewer is called exactly once, and None is returned.
+    Test: passes iff no NameError, call_count==1, return value is None.
+    """
+    adapter = _make_adapter(tmp_path)
+    args = {"goal": "deploy the new release"}  # elevated tier → gated
+
+    with patch("hermes_mpm.gate.adapter.call_reviewer", return_value="ALLOW") as mock_call:
+        result = adapter.hook_callback(
+            tool_name="delegate_task", args=args, tool_call_id="full-review-allow"
+        )
+
+    assert mock_call.call_count == 1, (
+        f"reviewer must be called once on a cold gated call; got {mock_call.call_count}"
+    )
+    assert result is None, (
+        f"ALLOW verdict must produce None (no block); got {result!r}"
+    )
+
+
+def test_hook_callback_full_review_path_block(tmp_path):
+    """hook_callback traverses review path and returns block message on BLOCK verdict.
+
+    Why: Confirms the block-path string is assembled from tool_name (not the formerly
+    stray function_name) and that the return value is a non-None string containing the
+    reason.
+    What: mock call_reviewer to return 'BLOCK: too risky'; assert returned string
+    contains '[review-gate]' and the block reason.
+    Test: passes iff return is non-None str with expected content.
+    """
+    adapter = _make_adapter(tmp_path)
+    args = {"goal": "delete all production records"}  # elevated → gated
+
+    with patch("hermes_mpm.gate.adapter.call_reviewer", return_value="BLOCK: too risky") as mock_call:
+        result = adapter.hook_callback(
+            tool_name="delegate_task", args=args, tool_call_id="full-review-block"
+        )
+
+    assert mock_call.call_count == 1
+    assert result is not None, "BLOCK verdict must produce a non-None block message"
+    assert "[review-gate]" in result, f"block message must contain '[review-gate]'; got {result!r}"
+    assert "too risky" in result, f"block message must contain reason; got {result!r}"
+
+
+def test_hook_callback_full_review_path_tighten_returns_none(tmp_path):
+    """hook_callback returns None on TIGHTEN (block path does not apply constraints; middleware does).
+
+    Why: The hook is the block seam only. On TIGHTEN verdict the hook returns None
+    (allow-through) because constraints are applied by middleware_callback, not here.
+    What: mock TIGHTEN with a constraint; assert hook returns None.
+    Test: passes iff hook returns None on a valid TIGHTEN.
+    """
+    adapter = _make_adapter(tmp_path)
+    args = {"goal": "rotate the auth keys"}  # elevated → gated
+
+    with patch("hermes_mpm.gate.adapter.call_reviewer",
+               return_value="TIGHTEN: limit scope to staging only") as mock_call:
+        result = adapter.hook_callback(
+            tool_name="delegate_task", args=args, tool_call_id="full-review-tighten"
+        )
+
+    assert mock_call.call_count == 1
+    assert result is None, (
+        f"TIGHTEN verdict must produce None from hook (block path); got {result!r}"
+    )
+
+
 # ── 5. ADAPTER MEMOIZATION ──────────────────────────────────────────────────
 
 

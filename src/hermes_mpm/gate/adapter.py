@@ -69,7 +69,7 @@ class ReviewGateAdapter:
 
     # ── seam: block path ────────────────────────────────────────────────────
 
-    def hook_callback(self, tool_name: str = "", args: dict = None, **kwargs) -> str | None:
+    def hook_callback(self, tool_name: str = "", args: dict | None = None, **kwargs) -> str | None:
         """pre_tool_call hook: block path. Returns a block message, or None to allow.
 
         Why: The engine's invoke_hook("pre_tool_call", ...) dispatches with
@@ -78,15 +78,15 @@ class ReviewGateAdapter:
         function_args which never matched, so every call raised TypeError and the
         gate silently crashed on every tool call.
         What: Accept tool_name/args to match the engine's actual kwarg names.
-        Test: Call hook_callback(tool_name="delegate_task", args={}) — should not
-        raise TypeError and should return a block/None verdict.
+        Test: Call hook_callback(tool_name="delegate_task", args={...}) — must not
+        raise TypeError/NameError and must return a block/None verdict from the
+        reviewer path.
         """
         if tool_name != DELEGATE_TOOL:
             return None
-        function_args = args or {}
         tool_call_id = kwargs.get("tool_call_id")
 
-        verdict = self._get_or_review(tool_call_id, tool_name, function_args)
+        verdict = self._get_or_review(tool_call_id, tool_name, args or {})
         if verdict.decision == "block":
             return f"[review-gate] BLOCKED: {verdict.reason}"
         return None
