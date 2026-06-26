@@ -147,9 +147,7 @@ _AXI_CHEATSHEET: str = (
     "  weather-axi current \"<location>\" | forecast \"<location>\" [--days N]\n"
     "  ocr-axi image <path> | pdf-text <path>\n\n"
     "ROUTING: web/news/current events → tavily-axi or exa-axi; "
-    "stored knowledge → lore-axi kb-search; ops → cluster-ops-axi.\n\n"
-    "PARALLEL: Multiple INDEPENDENT lookups (gh-axi, lore-axi, tavily-axi, file reads)? "
-    "Issue ALL as parallel tool calls in ONE turn — never one per turn. No shell & wait."
+    "stored knowledge → lore-axi kb-search; ops → cluster-ops-axi."
 )
 
 
