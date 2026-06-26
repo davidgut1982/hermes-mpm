@@ -123,9 +123,14 @@ A working example lives at `config.example.yaml`.
 ## Orchestrate tool
 
 `hermes_mpm_orchestrate({goal, subtasks: [{profile, goal, context?}, ...]})`
-validates the subtasks (non-empty; each needs a known `profile` + `goal`) then
-issues one batched `delegate_task` with `role: leaf`, returning the aggregated
-result. v1 is caller-supplied subtasks (no LLM decomposition).
+validates the subtasks (non-empty; each needs a known `profile` + `goal`), then
+runs each subtask through the review gate before dispatch — the internal fan-out
+bypasses the engine's `pre_tool_call` hook, so the tool applies the same verdict
+logic itself. Surviving subtasks go out in one batched `delegate_task` with
+`role: leaf`; any gate-blocked subtasks are reported back in a `blocked` array
+alongside the aggregated result. If every subtask is blocked, nothing is
+dispatched and the tool returns `{"error": ..., "blocked": [...]}`. v1 is
+caller-supplied subtasks (no LLM decomposition).
 
 ## Layout
 
