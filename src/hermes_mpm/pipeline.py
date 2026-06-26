@@ -17,7 +17,7 @@ import json
 import logging
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 logger = logging.getLogger("hermes_mpm.pipeline")
 
@@ -41,6 +41,7 @@ _pipelines_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _next_phase(current: str) -> str | None:
     """Return the next phase after *current*, or None if already at the end."""
@@ -125,7 +126,17 @@ RECORD_EVIDENCE_SCHEMA: Dict[str, Any] = {
             },
             "type": {
                 "type": "string",
-                "enum": ["file", "constraint", "approach", "verdict", "test", "lint", "review", "test-suite", "documentation"],
+                "enum": [
+                    "file",
+                    "constraint",
+                    "approach",
+                    "verdict",
+                    "test",
+                    "lint",
+                    "review",
+                    "test-suite",
+                    "documentation",
+                ],
                 "description": "Evidence type.",
             },
             "key": {
@@ -209,7 +220,8 @@ RECOVER_SCHEMA: Dict[str, Any] = {
 # Tool handlers
 # ---------------------------------------------------------------------------
 
-def handle_init(args: Dict[str, Any]) -> str:
+
+def handle_init(args: Dict[str, Any], **_ctx: Any) -> str:
     """Initialize a pipeline run."""
     task_id = args["task_id"]
     description = args.get("description", "")
@@ -237,15 +249,17 @@ def handle_init(args: Dict[str, Any]) -> str:
                 _pipelines[task_id]["phases"][p]["status"] = "active"
                 break
 
-    return json.dumps({
-        "success": True,
-        "task_id": task_id,
-        "current_phase": _pipelines[task_id]["current_phase"],
-        "message": f"Pipeline initialized for task {task_id}",
-    })
+    return json.dumps(
+        {
+            "success": True,
+            "task_id": task_id,
+            "current_phase": _pipelines[task_id]["current_phase"],
+            "message": f"Pipeline initialized for task {task_id}",
+        }
+    )
 
 
-def handle_transition(args: Dict[str, Any]) -> str:
+def handle_transition(args: Dict[str, Any], **_ctx: Any) -> str:
     """Transition to the next phase."""
     task_id = args["task_id"]
     target = args["phase"]
@@ -253,45 +267,58 @@ def handle_transition(args: Dict[str, Any]) -> str:
     with _pipelines_lock:
         pipeline = _pipelines.get(task_id)
         if not pipeline:
-            return json.dumps({"success": False, "error": f"Pipeline {task_id} not found. Call pipeline_init first."})
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Pipeline {task_id} not found. Call pipeline_init first.",
+                }
+            )
 
         current = pipeline["current_phase"]
         if pipeline["phases"].get(current, {}).get("status") not in ("done", "skipped"):
-            return json.dumps({
-                "success": False,
-                "error": f"Cannot transition from '{current}' to '{target}': current phase gate not passed. Verify the gate first.",
-                "current_phase": current,
-            })
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Cannot transition from '{current}' to '{target}': current phase gate not passed. Verify the gate first.",
+                    "current_phase": current,
+                }
+            )
 
         # Validate phase order
         if _phase_index(target) <= _phase_index(current):
-            return json.dumps({
-                "success": False,
-                "error": f"Cannot go backward from '{current}' to '{target}'.",
-                "current_phase": current,
-            })
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Cannot go backward from '{current}' to '{target}'.",
+                    "current_phase": current,
+                }
+            )
 
         if pipeline["phases"].get(target, {}).get("status") == "skipped":
-            return json.dumps({
-                "success": False,
-                "error": f"Phase '{target}' was skipped. Cannot transition to a skipped phase.",
-                "current_phase": current,
-            })
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Phase '{target}' was skipped. Cannot transition to a skipped phase.",
+                    "current_phase": current,
+                }
+            )
 
         pipeline["current_phase"] = target
         pipeline["phases"][target]["status"] = "active"
         pipeline["updated_at"] = time.time()
 
-    return json.dumps({
-        "success": True,
-        "task_id": task_id,
-        "previous_phase": current,
-        "current_phase": target,
-        "message": f"Transitioned to '{target}'",
-    })
+    return json.dumps(
+        {
+            "success": True,
+            "task_id": task_id,
+            "previous_phase": current,
+            "current_phase": target,
+            "message": f"Transitioned to '{target}'",
+        }
+    )
 
 
-def handle_record_evidence(args: Dict[str, Any]) -> str:
+def handle_record_evidence(args: Dict[str, Any], **_ctx: Any) -> str:
     """Record evidence at a gate."""
     task_id = args["task_id"]
     phase = args["phase"]
@@ -324,16 +351,18 @@ def handle_record_evidence(args: Dict[str, Any]) -> str:
 
         pipeline["updated_at"] = time.time()
 
-    return json.dumps({
-        "success": True,
-        "task_id": task_id,
-        "phase": phase,
-        "evidence_key": args["key"],
-        "status": args["status"],
-    })
+    return json.dumps(
+        {
+            "success": True,
+            "task_id": task_id,
+            "phase": phase,
+            "evidence_key": args["key"],
+            "status": args["status"],
+        }
+    )
 
 
-def handle_verify_gate(args: Dict[str, Any]) -> str:
+def handle_verify_gate(args: Dict[str, Any], **_ctx: Any) -> str:
     """Verify that a phase gate has passed."""
     task_id = args["task_id"]
     phase = args["phase"]
@@ -349,14 +378,16 @@ def handle_verify_gate(args: Dict[str, Any]) -> str:
         phase_data = pipeline["phases"][phase]
 
         if phase_data["status"] == "skipped":
-            return json.dumps({
-                "success": True,
-                "task_id": task_id,
-                "phase": phase,
-                "passed": True,
-                "message": f"Phase '{phase}' was skipped.",
-                "evidence_count": 0,
-            })
+            return json.dumps(
+                {
+                    "success": True,
+                    "task_id": task_id,
+                    "phase": phase,
+                    "passed": True,
+                    "message": f"Phase '{phase}' was skipped.",
+                    "evidence_count": 0,
+                }
+            )
 
         # Evidence is required: at least one evidence with status="pass"
         evidence = phase_data.get("evidence", [])
@@ -369,20 +400,24 @@ def handle_verify_gate(args: Dict[str, Any]) -> str:
         if all_pass:
             phase_data["status"] = "done"
 
-        return json.dumps({
-            "success": True,
-            "task_id": task_id,
-            "phase": phase,
-            "passed": all_pass,
-            "message": "All evidence checks passed" if all_pass else f"{len(failed_items)} failed, {len(pending)} pending, {len(passed_items)} passed",
-            "evidence_count": len(evidence),
-            "passed_count": len(passed_items),
-            "failed_count": len(failed_items),
-            "pending_count": len(pending),
-        })
+        return json.dumps(
+            {
+                "success": True,
+                "task_id": task_id,
+                "phase": phase,
+                "passed": all_pass,
+                "message": "All evidence checks passed"
+                if all_pass
+                else f"{len(failed_items)} failed, {len(pending)} pending, {len(passed_items)} passed",
+                "evidence_count": len(evidence),
+                "passed_count": len(passed_items),
+                "failed_count": len(failed_items),
+                "pending_count": len(pending),
+            }
+        )
 
 
-def handle_status(args: Dict[str, Any]) -> str:
+def handle_status(args: Dict[str, Any], **_ctx: Any) -> str:
     """Show pipeline status."""
     task_id = args.get("task_id", "")
 
@@ -403,7 +438,9 @@ def handle_status(args: Dict[str, Any]) -> str:
                 result["phases"][p] = {
                     "status": data["status"],
                     "evidence_count": len(data.get("evidence", [])),
-                    "passed_count": len([e for e in data.get("evidence", []) if e.get("status") == "pass"]),
+                    "passed_count": len(
+                        [e for e in data.get("evidence", []) if e.get("status") == "pass"]
+                    ),
                 }
             return json.dumps({"success": True, "pipeline": result})
         else:
@@ -418,7 +455,7 @@ def handle_status(args: Dict[str, Any]) -> str:
             return json.dumps({"success": True, "pipelines": summary, "count": len(summary)})
 
 
-def handle_recover(args: Dict[str, Any]) -> str:
+def handle_recover(args: Dict[str, Any], **_ctx: Any) -> str:
     """Handle a pipeline failure."""
     task_id = args["task_id"]
     strategy = args["strategy"]
@@ -448,10 +485,12 @@ def handle_recover(args: Dict[str, Any]) -> str:
 
         pipeline["updated_at"] = time.time()
 
-    return json.dumps({
-        "success": True,
-        "task_id": task_id,
-        "strategy": strategy,
-        "phase": current,
-        "message": msg,
-    })
+    return json.dumps(
+        {
+            "success": True,
+            "task_id": task_id,
+            "strategy": strategy,
+            "phase": current,
+            "message": msg,
+        }
+    )

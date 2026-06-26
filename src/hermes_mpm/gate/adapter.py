@@ -32,9 +32,14 @@ DELEGATE_TOOL = "delegate_task"
 class ReviewGateAdapter:
     """Hermes plugin wiring: tool_request middleware (tighten) + pre_tool_call hook (block)."""
 
-    def __init__(self, gate_config: ReviewGateConfig, audit_store: AuditStore,
-                 *, fail_closed_override: bool = False,
-                 fail_closed_reason: str = "") -> None:
+    def __init__(
+        self,
+        gate_config: ReviewGateConfig,
+        audit_store: AuditStore,
+        *,
+        fail_closed_override: bool = False,
+        fail_closed_reason: str = "",
+    ) -> None:
         self._cfg = gate_config
         self._audit = audit_store
         self._memo: dict[str, Verdict] = {}  # tool_call_id -> verdict
@@ -69,17 +74,49 @@ class ReviewGateAdapter:
 
     # ── seam: block path ────────────────────────────────────────────────────
 
-    def hook_callback(self, function_name: str, function_args: dict, **kwargs) -> str | None:
-        """pre_tool_call hook: block path. Returns a block message, or None to allow."""
-        if function_name != DELEGATE_TOOL:
+    def hook_callback(self, tool_name: str = "", args: dict | None = None, **kwargs) -> dict | None:
+        """pre_tool_call hook: block path. Returns a block directive dict, or None.
+
+        Why: The engine's get_pre_tool_call_block_message (hermes_cli/plugins.py
+        ~1942) ONLY honors a dict of shape {"action": "block", "message": <str>};
+        ``if not isinstance(result, dict): continue`` silently drops anything else,
+        then requires ``result.get("action") == "block"``. The prior bare-string
+        return was therefore dropped on the floor — the gate never blocked. Also,
+        the engine dispatches with tool_name=/args= as kwargs, so those are the
+        accepted parameter names.
+        What: On a BLOCK verdict return {"action": "block", "message": <reason>}
+        (keeping the "[review-gate] BLOCKED: ..." text in the message). On
+        allow/tighten return None (allow-through; tighten is applied by middleware).
+        Test: hook_callback(tool_name="delegate_task", args={elevated}) with a
+        BLOCK verdict → dict with action=="block" and the reason in "message";
+        allow/tighten → None.
+        """
+        if tool_name != DELEGATE_TOOL:
             return None
-        args = function_args or {}
         tool_call_id = kwargs.get("tool_call_id")
 
-        verdict = self._get_or_review(tool_call_id, function_name, args)
+        verdict = self._get_or_review(tool_call_id, tool_name, args or {})
         if verdict.decision == "block":
-            return f"[review-gate] BLOCKED: {verdict.reason}"
+            return {
+                "action": "block",
+                "message": f"[review-gate] BLOCKED: {verdict.reason}",
+            }
         return None
+
+    def evaluate(self, tool_name: str, args: dict, tool_call_id=None) -> Verdict:
+        """Run the gate verdict for a tool call (shared by hook + orchestrator).
+
+        Why: Finding 2 — the orchestrate tool fans out delegate_task via the
+        internal registry, which bypasses the pre_tool_call hook. To gate those
+        subtasks with the SAME logic the hook uses, both paths must call one
+        function. This is that single source of truth.
+        What: Delegates to the memoized review path and returns the Verdict.
+        Test: evaluate("delegate_task", {elevated goal}) with a mocked BLOCK
+        reviewer → Verdict(decision="block").
+        """
+        if tool_name != DELEGATE_TOOL:
+            return Verdict(decision="allow", added_constraints=[], reason="")
+        return self._get_or_review(tool_call_id, tool_name, args or {})
 
     # ── core review (memoized) ──────────────────────────────────────────────
 
@@ -98,8 +135,9 @@ class ReviewGateAdapter:
         """Run the actual review for a (possibly batched) delegate_task call."""
         # Cross-lab fail-closed override: block everything.
         if self._fail_closed_override:
-            verdict = Verdict(decision="block", added_constraints=[],
-                              reason=self._fail_closed_reason)
+            verdict = Verdict(
+                decision="block", added_constraints=[], reason=self._fail_closed_reason
+            )
             self._record(tool_call_id, tool_name, args, "n/a", verdict)
             return verdict
 
@@ -143,11 +181,13 @@ class ReviewGateAdapter:
                 all_constraints.extend(v.added_constraints)
 
         if block_reasons:
-            return Verdict(decision="block", added_constraints=[],
-                           reason="; ".join(block_reasons))
+            return Verdict(decision="block", added_constraints=[], reason="; ".join(block_reasons))
         if saw_tighten:
-            return Verdict(decision="tighten", added_constraints=all_constraints,
-                           reason="reviewer added constraints (batch)")
+            return Verdict(
+                decision="tighten",
+                added_constraints=all_constraints,
+                reason="reviewer added constraints (batch)",
+            )
         return Verdict(decision="allow", added_constraints=[], reason="")
 
     # ── helpers ─────────────────────────────────────────────────────────────
@@ -160,8 +200,9 @@ class ReviewGateAdapter:
         tightened["gate_constraints"] = existing + list(constraints)
         return tightened
 
-    def _record(self, tool_call_id, tool_name: str, args: dict,
-                blast: str, verdict: Verdict) -> None:
+    def _record(
+        self, tool_call_id, tool_name: str, args: dict, blast: str, verdict: Verdict
+    ) -> None:
         try:
             self._audit.record(
                 tool_call_id=str(tool_call_id or ""),
@@ -174,3 +215,39 @@ class ReviewGateAdapter:
             )
         except Exception as exc:  # audit must never break the gate
             logger.debug("hermes-mpm gate: audit write skipped: %s", exc)
+
+
+# ── module-level shared gate access (Finding 2: one source of truth) ─────────
+# The live adapter instance is registered here by register_gate() so the
+# orchestrate tool can apply the SAME verdict logic the pre_tool_call hook uses.
+_ACTIVE_ADAPTER: ReviewGateAdapter | None = None
+
+
+def set_active_adapter(adapter: ReviewGateAdapter | None) -> None:
+    """Register (or clear) the live gate adapter for module-level evaluate().
+
+    Why: The orchestrate tool dispatches delegate_task internally (bypassing the
+    pre_tool_call hook), so it needs a reference to the armed gate to evaluate
+    subtasks with identical logic. register_gate() sets this; tests clear it.
+    What: Sets the module global ``_ACTIVE_ADAPTER``.
+    Test: set_active_adapter(a); evaluate(...) uses a. set_active_adapter(None);
+    evaluate(...) returns allow.
+    """
+    global _ACTIVE_ADAPTER
+    _ACTIVE_ADAPTER = adapter
+
+
+def evaluate(tool_name: str, args: dict, tool_call_id=None) -> Verdict:
+    """Evaluate a tool call against the armed gate; ALLOW if no gate is armed.
+
+    Why: Finding 2 — single entry point both hook_callback and the orchestrator
+    use, so fan-out subtasks are gated exactly as direct delegate_task calls are.
+    What: Delegates to the active adapter's ``evaluate``; with no armed gate it
+    returns an ALLOW verdict (degrade to pre-gate behavior rather than hard-block
+    all fan-out, mirroring the disabled-gate path).
+    Test: with an active adapter and a BLOCK reviewer → block; with no adapter →
+    allow.
+    """
+    if _ACTIVE_ADAPTER is None:
+        return Verdict(decision="allow", added_constraints=[], reason="")
+    return _ACTIVE_ADAPTER.evaluate(tool_name, args, tool_call_id=tool_call_id)

@@ -12,11 +12,35 @@ Test: this file — run pytest.
 from __future__ import annotations
 
 import json
-import time
 import threading
+import time
 from typing import Any
+from unittest.mock import patch
+
+import pytest
 
 from hermes_mpm import orchestrator
+from hermes_mpm.gate import adapter as gate_adapter
+from hermes_mpm.gate.verdict import Verdict
+
+
+@pytest.fixture(autouse=True)
+def _isolate_gate_and_agent():
+    """Reset gate + captured-agent state around every orchestrator test.
+
+    Why: register_gate() (exercised in test_gate.py) installs a live, possibly
+    fail-closed adapter via set_active_adapter — that would leak into other tests
+    and block all fan-out. Each test must start from a clean, unarmed gate and no
+    captured agent so it controls its own gating/agent state explicitly.
+    What: clears the active gate adapter and the captured agent before and after.
+    Test: implicit — the legacy "dispatch happens" tests pass without per-test gate
+    patching because the gate is unarmed (evaluate → allow) by default.
+    """
+    gate_adapter.set_active_adapter(None)
+    orchestrator.clear_agent()
+    yield
+    gate_adapter.set_active_adapter(None)
+    orchestrator.clear_agent()
 
 
 class _RecordingCtx:
@@ -211,3 +235,184 @@ def test_concurrent_dispatch_timing():
         f"Elapsed {elapsed:.2f}s suggests serial execution (~0.9s). "
         f"Expected concurrent (~0.3s). max=0.6s allowed."
     )
+
+
+# ── FINDING 2: orchestrate must gate each subtask before dispatch ─────────────
+# handle() dispatches via registry.dispatch / ctx.dispatch_tool, which does NOT
+# pass through the engine's pre_tool_call hook. So fan-out reaches delegate_task
+# UNGATED unless handle() applies the gate verdict itself. These tests prove it
+# now does, reusing the SAME evaluate() the hook uses (one source of truth).
+
+
+def _set_gate(verdict_for):
+    """Install a fake evaluate() that maps a subtask goal substring -> Verdict.
+
+    Why: Drive handle()'s gating decision deterministically without a reviewer.
+    What: patches gate_adapter.evaluate; verdict_for(goal) returns a Verdict.
+    Test: used by the Finding-2 tests below.
+    """
+
+    def _fake_evaluate(tool_name, args, tool_call_id=None):
+        goal = (
+            (args.get("tasks") or [{}])[0].get("goal") if args.get("tasks") else args.get("goal")
+        ) or ""
+        return verdict_for(goal)
+
+    return patch.object(gate_adapter, "evaluate", side_effect=_fake_evaluate)
+
+
+def test_blockable_subtask_is_skipped(tmp_path):
+    """A subtask the gate would BLOCK is not dispatched; the rest still run.
+
+    Why: Finding 2 — ungated fan-out let a blockable subtask reach delegate_task.
+    What: gate blocks any goal containing 'delete'; the safe subtask is dispatched,
+    the blocked one is reported in the result and excluded from the payload.
+    Test: 2 subtasks (one 'delete prod', one 'list status') → dispatched tasks == 1
+    and the result records the blocked subtask.
+    """
+    ctx = _RecordingCtx(result='{"results": ["ok"]}')
+    orchestrator.set_ctx(ctx)
+
+    def verdict_for(goal):
+        if "delete" in goal:
+            return Verdict(decision="block", reason="destructive")
+        return Verdict(decision="allow")
+
+    with _set_gate(verdict_for):
+        out = json.loads(
+            orchestrator.handle(
+                {
+                    "goal": "mixed batch",
+                    "subtasks": [
+                        {"profile": "ops", "goal": "delete prod database"},
+                        {"profile": "ops", "goal": "list status"},
+                    ],
+                }
+            )
+        )
+
+    # Exactly one dispatch, carrying only the allowed subtask.
+    assert len(ctx.calls) == 1, "one batched dispatch for the surviving subtask"
+    _, args, _ = ctx.calls[0]
+    assert len(args["tasks"]) == 1, "blocked subtask must be excluded from dispatch"
+    assert args["tasks"][0]["goal"] == "list status"
+    # The blocked subtask is surfaced to the caller.
+    assert "blocked" in out, f"result must report blocked subtasks; got {out!r}"
+    assert any("delete prod database" in b.get("goal", "") for b in out["blocked"])
+
+
+def test_all_subtasks_blocked_no_dispatch(tmp_path):
+    """If the gate blocks every subtask, no delegate_task dispatch happens at all.
+
+    Why: Finding 2 — blocking must actually prevent ungated delegation.
+    What: gate blocks all; handle() returns an error/blocked result and never dispatches.
+    Test: ctx.calls is empty; result reports the blocks.
+    """
+    ctx = _RecordingCtx()
+    orchestrator.set_ctx(ctx)
+
+    with _set_gate(lambda goal: Verdict(decision="block", reason="nope")):
+        out = json.loads(
+            orchestrator.handle(
+                {
+                    "goal": "all dangerous",
+                    "subtasks": [
+                        {"profile": "ops", "goal": "delete a"},
+                        {"profile": "ops", "goal": "drop b"},
+                    ],
+                }
+            )
+        )
+
+    assert len(ctx.calls) == 0, "no dispatch when every subtask is blocked"
+    assert out.get("blocked"), "result must list the blocked subtasks"
+    assert len(out["blocked"]) == 2
+
+
+def test_allowed_subtasks_dispatch_normally(tmp_path):
+    """When the gate allows all subtasks, dispatch is unchanged (no regression).
+
+    Why: Finding 2 must not break the happy path.
+    What: gate allows all → single batched dispatch with both tasks.
+    Test: one dispatch call, two tasks, no 'blocked' key in result.
+    """
+    ctx = _RecordingCtx(result='{"results": ["a", "b"]}')
+    orchestrator.set_ctx(ctx)
+
+    with _set_gate(lambda goal: Verdict(decision="allow")):
+        out = json.loads(
+            orchestrator.handle(
+                {
+                    "goal": "safe batch",
+                    "subtasks": [
+                        {"profile": "ops", "goal": "check plex"},
+                        {"profile": "ops", "goal": "check disk"},
+                    ],
+                }
+            )
+        )
+
+    assert len(ctx.calls) == 1
+    _, args, _ = ctx.calls[0]
+    assert len(args["tasks"]) == 2
+    assert out == {"results": ["a", "b"]}
+
+
+# ── FINDING 3: no stale-agent global; per-call agent is correct ──────────────
+
+
+def test_no_module_global_captured_agent():
+    """The stale, race-prone module global _captured_agent must be gone.
+
+    Why: Finding 3 — a bare module global set in pre_llm_call leaks across turns
+    and races across concurrent sessions. The fix replaces it with a contextvar
+    (or uses the per-call agent directly), so the bare global must not exist.
+    What: assert orchestrator has no module attribute named _captured_agent.
+    Test: not hasattr(orchestrator, '_captured_agent').
+    """
+    assert not hasattr(orchestrator, "_captured_agent"), (
+        "Finding 3: bare module global _captured_agent must be removed "
+        "(replaced by a per-call contextvar)"
+    )
+
+
+def test_capture_agent_is_isolated_per_context():
+    """capture_agent stores into a contextvar, not a shared mutable global.
+
+    Why: Finding 3 — concurrency safety. A value set in one context must not be
+    visible as a stale default after it is cleared.
+    What: capture_agent(x) then clear_agent() → current_agent() is None again.
+    Test: set, assert visible; clear, assert None (no stale leak).
+    """
+    sentinel = object()
+    orchestrator.capture_agent(sentinel)
+    assert orchestrator.current_agent() is sentinel, "captured agent must be readable in-context"
+    orchestrator.clear_agent()
+    assert orchestrator.current_agent() is None, (
+        "Finding 3: cleared agent must not leak as a stale value to the next turn"
+    )
+
+
+def test_short_turn_does_not_read_stale_agent(tmp_path):
+    """After clear, a fan-out with no captured agent falls back to ctx.dispatch_tool.
+
+    Why: Finding 3(a) — capture happened after the short-message guard, so a short
+    turn could read a STALE agent from a prior turn. With a contextvar that is
+    cleared, no stale agent is read; handle() uses the ctx.dispatch_tool fallback.
+    What: clear the agent, dispatch a safe batch → uses ctx.dispatch_tool path.
+    Test: ctx.dispatch_tool was called (fallback), proving no stale parent_agent.
+    """
+    orchestrator.clear_agent()
+    ctx = _RecordingCtx(result='{"results": ["x"]}')
+    orchestrator.set_ctx(ctx)
+
+    with _set_gate(lambda goal: Verdict(decision="allow")):
+        orchestrator.handle(
+            {
+                "goal": "safe",
+                "subtasks": [{"profile": "ops", "goal": "list status"}],
+            }
+        )
+
+    # No captured agent → fell back to ctx.dispatch_tool (one recorded call).
+    assert len(ctx.calls) == 1, "fallback dispatch path must run when no agent captured"

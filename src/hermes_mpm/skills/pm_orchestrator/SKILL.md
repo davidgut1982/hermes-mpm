@@ -100,4 +100,7 @@ Guiding principles:
 - **The review gate enforces the Code-Critic stage at the delegation boundary.**
   Any `delegate_task` call at an elevated tier is intercepted by the gate before
   the task reaches the child agent; the gate calls an independent reviewer and
-  may block or tighten the task. This is the Code-Critic stage made structural.
+  may block or tighten the task. This applies to the per-subtask fan-out from
+  `hermes_mpm_orchestrate` too — each subtask is run through the same verdict
+  logic before dispatch, and blocked subtasks are dropped and reported back in a
+  `blocked` array. This is the Code-Critic stage made structural.

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 
-from .adapter import ReviewGateAdapter
+from .adapter import ReviewGateAdapter, set_active_adapter
 from .audit import AuditStore
 from .config import ReviewGateConfig, load_gate_config
 
@@ -139,7 +139,8 @@ def register_gate(ctx, *, raw_config: dict | None = None) -> None:
     # Log derived labs at startup so operators can verify cross-lab independence.
     logger.info(
         "hermes-mpm gate: orchestrator_lab=%r reviewer_lab=%r",
-        orchestrator_lab or "(unknown)", reviewer_lab or "(unknown)",
+        orchestrator_lab or "(unknown)",
+        reviewer_lab or "(unknown)",
     )
 
     # Determine initial fail-closed reason before seam registration.
@@ -166,10 +167,17 @@ def register_gate(ctx, *, raw_config: dict | None = None) -> None:
 
     audit = AuditStore(cfg.audit_path)
     adapter = ReviewGateAdapter(
-        cfg, audit,
+        cfg,
+        audit,
         fail_closed_override=fail_closed_override,
         fail_closed_reason=fail_closed_reason,
     )
+
+    # Finding 2: expose the live adapter so the orchestrate tool can gate its
+    # fan-out subtasks with the SAME verdict logic (the internal registry dispatch
+    # bypasses the pre_tool_call hook). Set before seam registration so even a
+    # fail-closed gate is enforced for fan-out.
+    set_active_adapter(adapter)
 
     # Step 1: Register the pre_tool_call hook FIRST — it is the load-bearing
     # block seam. If it fails, abort gate registration entirely by re-raising.
@@ -186,6 +194,9 @@ def register_gate(ctx, *, raw_config: dict | None = None) -> None:
         )
         logger.error("hermes-mpm gate: %s", msg)
         logger.error("review gate: FAILED → GATE ABORTED (hook seam unavailable)")
+        # Gate is aborted — no blocking capability. Clear the active adapter so the
+        # orchestrate tool does not gate against a half-armed instance.
+        set_active_adapter(None)
         raise GateArmingError(msg) from exc
 
     # Step 2: Register middleware AFTER the hook. If middleware fails, the hook

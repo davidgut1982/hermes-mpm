@@ -13,6 +13,9 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import pytest
+
+from hermes_mpm.gate import adapter as _adapter_mod
 from hermes_mpm.gate import config as config_mod
 from hermes_mpm.gate import tiering
 from hermes_mpm.gate import tighten as tighten_mod
@@ -20,6 +23,22 @@ from hermes_mpm.gate import verdict as verdict_mod
 from hermes_mpm.gate.adapter import ReviewGateAdapter
 from hermes_mpm.gate.audit import AuditStore
 from hermes_mpm.gate.config import ReviewGateConfig
+
+
+@pytest.fixture(autouse=True)
+def _reset_active_adapter():
+    """Clear the module-level active gate adapter around every gate test.
+
+    Why: register_gate() now installs a live adapter via set_active_adapter so the
+    orchestrate tool can gate fan-out (Finding 2). That global must not leak across
+    tests (it would gate other modules' dispatches). Reset before and after.
+    What: set_active_adapter(None) on entry and exit.
+    Test: implicit — gate tests stay independent of each other's armed state.
+    """
+    _adapter_mod.set_active_adapter(None)
+    yield
+    _adapter_mod.set_active_adapter(None)
+
 
 # ── 1. TIERING ──────────────────────────────────────────────────────────────
 
@@ -156,6 +175,7 @@ def test_tighten_list_item_removed_invalid():
 # ''.startswith('') is True, so base="" let any proposed value pass the prefix
 # check. Fix: if base is empty and proposed is non-empty -> invalid.
 
+
 def test_tighten_finding2_empty_base_nonempty_proposed_invalid():
     """Finding 2: base='' and proposed='inject' must be invalid (not vacuously pass).
 
@@ -189,6 +209,7 @@ def test_tighten_finding2_nonempty_base_startswith_passes():
 # validate_tighten({'goal':'x'}, {'goal':42}) -> ok (isinstance guards no-op on
 # type mismatch). Fix: check type(base_val) is type(prop_val) before isinstance.
 
+
 def test_tighten_finding3_str_to_int_invalid():
     """Finding 3: str->int type change must be invalid.
 
@@ -212,9 +233,7 @@ def test_tighten_finding3_str_to_list_invalid():
 
 def test_tighten_finding3_list_to_dict_invalid():
     """Finding 3: list->dict type change must be invalid."""
-    ok, reason = tighten_mod.validate_tighten(
-        {"constraints": ["a"]}, {"constraints": {"a": "b"}}
-    )
+    ok, reason = tighten_mod.validate_tighten({"constraints": ["a"]}, {"constraints": {"a": "b"}})
     assert ok is False, "Finding 3: list->dict type change must be invalid"
 
 
@@ -228,8 +247,9 @@ def test_tighten_finding3_same_type_still_valid():
 
 
 def _make_adapter(tmp_path, *, enabled=True, fail_closed=True):
-    cfg = ReviewGateConfig(enabled=enabled, fail_closed=fail_closed,
-                           audit_path=tmp_path / "audit.jsonl")
+    cfg = ReviewGateConfig(
+        enabled=enabled, fail_closed=fail_closed, audit_path=tmp_path / "audit.jsonl"
+    )
     store = AuditStore(tmp_path / "audit.jsonl")
     return ReviewGateAdapter(cfg, store)
 
@@ -261,9 +281,13 @@ def test_cross_lab_same_lab_fail_closed(tmp_path):
     hook = registered["hooks"].get("pre_tool_call")
     assert hook is not None
     # In same-lab fail-closed mode, ALL delegate_task calls blocked.
-    msg = hook("delegate_task", {"goal": "list status"}, tool_call_id="x")
-    assert msg is not None
-    assert "cross-lab" in msg.lower()
+    # Engine contract (plugins.py get_pre_tool_call_block_message): the hook must
+    # return a dict {"action": "block", "message": <str>} for the engine to honor
+    # the block. A bare string is silently dropped.
+    res = hook("delegate_task", {"goal": "list status"}, tool_call_id="x")
+    assert isinstance(res, dict), "block result must be a dict for the engine to honor it"
+    assert res.get("action") == "block"
+    assert "cross-lab" in res.get("message", "").lower()
 
 
 def test_cross_lab_different_lab_normal(tmp_path):
@@ -293,8 +317,198 @@ def test_cross_lab_different_lab_normal(tmp_path):
     assert hook is not None
     # Different lab → normal mode: a trivial task is not auto-blocked by the guard.
     # (It is below the gated tier, so it is allowed without review.)
-    msg = hook("delegate_task", {"goal": "list status"}, tool_call_id="y")
-    assert msg is None
+    # ALLOW path returns None (no block dict).
+    res = hook("delegate_task", {"goal": "list status"}, tool_call_id="y")
+    assert res is None
+
+
+# ── 4b. FULL REVIEW PATH (line ~89 — the formerly broken path) ──────────────
+# Prior tests only exercised allow/tighten classification after memoization.
+# This suite exercises the hook_callback path cold (no memo hit) for a gated
+# tier, so _get_or_review → _review → _review_one → call_reviewer is traversed
+# end-to-end and verdict is returned — the path that would have raised NameError
+# if function_name still existed.
+
+
+def test_hook_callback_full_review_path_allow(tmp_path):
+    """hook_callback reaches _get_or_review for an elevated (gated) task and returns None on ALLOW.
+
+    Why: This is the exact path that commit 088503e fixed (function_name → tool_name).
+    A cold call (no prior memo) on an elevated task must reach the reviewer, get a
+    verdict, and return None (no block) when the reviewer says ALLOW.
+    What: mock call_reviewer to return 'ALLOW'; call hook_callback cold; assert no
+    NameError is raised, reviewer is called exactly once, and None is returned.
+    Test: passes iff no NameError, call_count==1, return value is None.
+    """
+    adapter = _make_adapter(tmp_path)
+    args = {"goal": "deploy the new release"}  # elevated tier → gated
+
+    with patch("hermes_mpm.gate.adapter.call_reviewer", return_value="ALLOW") as mock_call:
+        result = adapter.hook_callback(
+            tool_name="delegate_task", args=args, tool_call_id="full-review-allow"
+        )
+
+    assert mock_call.call_count == 1, (
+        f"reviewer must be called once on a cold gated call; got {mock_call.call_count}"
+    )
+    assert result is None, f"ALLOW verdict must produce None (no block); got {result!r}"
+
+
+def test_hook_callback_full_review_path_block(tmp_path):
+    """hook_callback traverses review path and returns block message on BLOCK verdict.
+
+    Why: Confirms the block-path string is assembled from tool_name (not the formerly
+    stray function_name) and that the return value is a non-None string containing the
+    reason.
+    What: mock call_reviewer to return 'BLOCK: too risky'; assert returned string
+    contains '[review-gate]' and the block reason.
+    Test: passes iff return is non-None str with expected content.
+    """
+    adapter = _make_adapter(tmp_path)
+    args = {"goal": "delete all production records"}  # elevated → gated
+
+    with patch(
+        "hermes_mpm.gate.adapter.call_reviewer", return_value="BLOCK: too risky"
+    ) as mock_call:
+        result = adapter.hook_callback(
+            tool_name="delegate_task", args=args, tool_call_id="full-review-block"
+        )
+
+    assert mock_call.call_count == 1
+    # Engine contract: block result is a dict {"action": "block", "message": <str>}.
+    assert isinstance(result, dict), "BLOCK verdict must produce a dict for the engine"
+    assert result.get("action") == "block", f"action must be 'block'; got {result!r}"
+    message = result.get("message", "")
+    assert "[review-gate]" in message, f"message must contain '[review-gate]'; got {message!r}"
+    assert "too risky" in message, f"message must contain reason; got {message!r}"
+
+
+def test_hook_callback_full_review_path_tighten_returns_none(tmp_path):
+    """hook_callback returns None on TIGHTEN (block path applies no constraints; middleware does).
+
+    Why: The hook is the block seam only. On TIGHTEN verdict the hook returns None
+    (allow-through) because constraints are applied by middleware_callback, not here.
+    What: mock TIGHTEN with a constraint; assert hook returns None.
+    Test: passes iff hook returns None on a valid TIGHTEN.
+    """
+    adapter = _make_adapter(tmp_path)
+    args = {"goal": "rotate the auth keys"}  # elevated → gated
+
+    with patch(
+        "hermes_mpm.gate.adapter.call_reviewer", return_value="TIGHTEN: limit scope to staging only"
+    ) as mock_call:
+        result = adapter.hook_callback(
+            tool_name="delegate_task", args=args, tool_call_id="full-review-tighten"
+        )
+
+    assert mock_call.call_count == 1
+    assert result is None, (
+        f"TIGHTEN verdict must produce None from hook (block path); got {result!r}"
+    )
+
+
+# ── 4c. ENGINE-SEAM CONTRACT (Finding 1 / Finding 5) ─────────────────────────
+# These tests drive the hook result through a faithful reimplementation of the
+# engine's get_pre_tool_call_block_message dispatch loop (plugins.py:1942-1949)
+# to prove the adapter's block dict is actually honored by the engine seam — not
+# just shaped correctly in isolation.
+
+
+def _engine_block_message(hook_results):
+    """Faithful copy of plugins.py get_pre_tool_call_block_message dispatch loop.
+
+    Why: The engine only honors a dict {"action": "block", "message": <str>};
+    a bare string or any non-dict is silently dropped (`if not isinstance(...): continue`).
+    What: Returns the first valid block message string, or None.
+    Test: feed it the adapter's hook output and assert a block message is produced.
+    """
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        if result.get("action") != "block":
+            continue
+        message = result.get("message")
+        if isinstance(message, str) and message:
+            return message
+    return None
+
+
+def test_engine_seam_honors_block_dict(tmp_path):
+    """End-to-end: a BLOCK verdict produces a message the engine seam actually surfaces.
+
+    Why: Finding 1 — the prior bare-string return was dropped by the engine's
+    isinstance(result, dict) guard, so the gate never blocked. This drives the
+    real engine dispatch shape.
+    What: hook_callback → engine loop → non-None block message.
+    Test: mock reviewer BLOCK; assert _engine_block_message(...) is the reason string.
+    """
+    adapter = _make_adapter(tmp_path)
+    args = {"goal": "delete all production records"}  # elevated → gated
+
+    with patch("hermes_mpm.gate.adapter.call_reviewer", return_value="BLOCK: nuke risk"):
+        hook_out = adapter.hook_callback(
+            tool_name="delegate_task", args=args, tool_call_id="seam-block"
+        )
+
+    # The engine receives a LIST of hook results; emulate that.
+    message = _engine_block_message([hook_out])
+    assert message is not None, "engine must surface a block message from the dict result"
+    assert "nuke risk" in message, f"engine block message must carry the reason; got {message!r}"
+
+
+def test_engine_seam_drops_bare_string_proof():
+    """Proof of Finding 1's root cause: a bare string is dropped by the engine loop.
+
+    Why: Documents WHY the dict contract is required — the old return shape
+    (a plain string) is silently ignored, so no block ever reached the engine.
+    What: feeding a bare string through the engine loop yields None (no block).
+    Test: _engine_block_message(["[review-gate] BLOCKED: x"]) is None.
+    """
+    assert _engine_block_message(["[review-gate] BLOCKED: x"]) is None, (
+        "a bare string must be dropped by the engine (this is the bug Finding 1 fixes)"
+    )
+
+
+# ── 4d. SHARED evaluate() — single source of truth (Finding 1 + Finding 2) ────
+
+
+def test_evaluate_matches_hook_block(tmp_path):
+    """evaluate() and hook_callback agree on a BLOCK verdict (one source of truth).
+
+    Why: Finding 2 — the orchestrator must reuse the SAME verdict logic the hook
+    uses so subtasks are gated identically. evaluate() is that shared function.
+    What: register a gate adapter, then call evaluate() directly; assert it blocks
+    the same elevated task the hook would.
+    Test: evaluate('delegate_task', {elevated goal}) -> Verdict(decision='block').
+    """
+    from hermes_mpm.gate import adapter as adapter_mod
+
+    adapter = _make_adapter(tmp_path)
+    adapter_mod.set_active_adapter(adapter)
+    try:
+        with patch("hermes_mpm.gate.adapter.call_reviewer", return_value="BLOCK: too risky"):
+            v = adapter_mod.evaluate(
+                "delegate_task", {"goal": "delete prod database"}, tool_call_id="ev1"
+            )
+        assert v.decision == "block", f"evaluate must block elevated task; got {v.decision}"
+        assert "too risky" in v.reason
+    finally:
+        adapter_mod.set_active_adapter(None)
+
+
+def test_evaluate_allows_when_no_gate_armed():
+    """evaluate() returns ALLOW when no gate adapter is registered.
+
+    Why: If the gate plugin did not arm (disabled / older core), the orchestrator
+    must not hard-block all fan-out — it degrades to the pre-gate behavior (allow).
+    What: with no active adapter, evaluate() returns decision='allow'.
+    Test: set_active_adapter(None); evaluate(...) -> allow.
+    """
+    from hermes_mpm.gate import adapter as adapter_mod
+
+    adapter_mod.set_active_adapter(None)
+    v = adapter_mod.evaluate("delegate_task", {"goal": "deploy prod"}, tool_call_id="ev2")
+    assert v.decision == "allow", "no armed gate → evaluate must allow (no hard block)"
 
 
 # ── 5. ADAPTER MEMOIZATION ──────────────────────────────────────────────────
@@ -342,11 +556,11 @@ def test_adapter_batch_reviews_each_task(tmp_path):
         return "ALLOW"
 
     with patch("hermes_mpm.gate.adapter.call_reviewer", side_effect=_fake_reviewer) as mock_call:
-        msg = adapter.hook_callback("delegate_task", args, tool_call_id="batch1")
+        res = adapter.hook_callback("delegate_task", args, tool_call_id="batch1")
     # Reviewer called once per task.
     assert mock_call.call_count == 2
-    # One task blocks → whole call blocks.
-    assert msg is not None
+    # One task blocks → whole call blocks → dict with action=block.
+    assert isinstance(res, dict) and res.get("action") == "block"
 
 
 # ── 8. AUDIT REDACTION ──────────────────────────────────────────────────────
@@ -355,9 +569,15 @@ def test_adapter_batch_reviews_each_task(tmp_path):
 def test_audit_redacts_api_key(tmp_path):
     path = tmp_path / "audit.jsonl"
     store = AuditStore(path)
-    store.record(tool_call_id="t1", tool_name="delegate_task",
-                 args={"api_key": "sk-abc123", "goal": "x"},
-                 blast_radius="elevated", decision="allow", reason="", constraints=[])
+    store.record(
+        tool_call_id="t1",
+        tool_name="delegate_task",
+        args={"api_key": "sk-abc123", "goal": "x"},
+        blast_radius="elevated",
+        decision="allow",
+        reason="",
+        constraints=[],
+    )
     raw = path.read_text()
     assert "sk-abc123" not in raw
     assert "<REDACTED>" in raw
@@ -366,9 +586,15 @@ def test_audit_redacts_api_key(tmp_path):
 def test_audit_redacts_token(tmp_path):
     path = tmp_path / "audit.jsonl"
     store = AuditStore(path)
-    store.record(tool_call_id="t2", tool_name="delegate_task",
-                 args={"token": "bearer-xyz-secret", "goal": "x"},
-                 blast_radius="elevated", decision="allow", reason="", constraints=[])
+    store.record(
+        tool_call_id="t2",
+        tool_name="delegate_task",
+        args={"token": "bearer-xyz-secret", "goal": "x"},
+        blast_radius="elevated",
+        decision="allow",
+        reason="",
+        constraints=[],
+    )
     raw = path.read_text()
     assert "bearer-xyz-secret" not in raw
     assert "<REDACTED>" in raw
@@ -377,9 +603,15 @@ def test_audit_redacts_token(tmp_path):
 def test_audit_all_fields_present(tmp_path):
     path = tmp_path / "audit.jsonl"
     store = AuditStore(path)
-    store.record(tool_call_id="t3", tool_name="delegate_task",
-                 args={"goal": "x"}, blast_radius="elevated",
-                 decision="tighten", reason="added constraint", constraints=["no deletes"])
+    store.record(
+        tool_call_id="t3",
+        tool_name="delegate_task",
+        args={"goal": "x"},
+        blast_radius="elevated",
+        decision="tighten",
+        reason="added constraint",
+        constraints=["no deletes"],
+    )
     rec = json.loads(path.read_text().strip().splitlines()[-1])
     assert rec["tool_call_id"] == "t3"
     assert rec["decision"] == "tighten"
@@ -399,8 +631,7 @@ def test_config_empty_defaults():
 
 
 def test_config_partial_override():
-    raw = {"hermes_mpm": {"review_gate": {"enabled": False,
-                                          "reviewer": {"model": "openai/gpt-x"}}}}
+    raw = {"hermes_mpm": {"review_gate": {"enabled": False, "reviewer": {"model": "openai/gpt-x"}}}}
     cfg = config_mod.load_gate_config(raw)
     assert cfg.enabled is False
     assert cfg.reviewer_model == "openai/gpt-x"
@@ -413,6 +644,7 @@ def test_config_partial_override():
 # HIGH-1: tighten-only prefix bypass
 # A rewritten string that is LONGER than the base but does not START WITH it
 # must be rejected. The original code only checks length, not prefix.
+
 
 def test_high1_tighten_rewrite_longer_but_diverges_is_invalid():
     """HIGH-1: longer value that does not start with the base must be rejected.
@@ -472,6 +704,7 @@ def test_high1_tighten_prefix_check_on_substance_keys():
 #      registered. The failure is visible in logs, not silent.
 #   2. Register middleware AFTER the hook. If it fails, the hook alone can block
 #      all delegate_task calls. Flip adapter to fail-closed; emit FAILED state.
+
 
 def test_high2_hook_registration_failure_aborts_gate(tmp_path):
     """HIGH-2 (Finding 1): if register_hook raises, register_gate must raise GateArmingError.
@@ -570,16 +803,18 @@ def test_high2_middleware_registration_failure_hook_blocks(tmp_path):
         ("run the tests", "standard"),
         ("deploy prod release", "elevated"),
     ]:
-        msg = hook_callback("delegate_task", {"goal": goal}, tool_call_id=f"hh3_{label}")
-        assert msg is not None, (
-            f"HIGH-2: hook must block {label!r} delegate_task when middleware failed; got None"
+        res = hook_callback("delegate_task", {"goal": goal}, tool_call_id=f"hh3_{label}")
+        assert isinstance(res, dict) and res.get("action") == "block", (
+            f"HIGH-2: hook must block {label!r} delegate_task when middleware failed; got {res!r}"
         )
+        msg = res.get("message", "")
         assert "[review-gate]" in msg or "block" in msg.lower(), (
             f"HIGH-2: block message must contain '[review-gate]' or 'block'; got {msg!r}"
         )
 
 
 # HIGH-3: empty TIGHTEN: is a silent ALLOW
+
 
 def test_high3_empty_tighten_parses_as_block():
     """HIGH-3: 'TIGHTEN:' with no constraint text must parse as BLOCK, not tighten.
@@ -617,11 +852,14 @@ def test_high3_adapter_blocks_empty_tighten_verdict(tmp_path):
 
     # Middleware must not apply empty constraints (returns None = no mutation).
     assert mw_result is None, "HIGH-3: middleware must not pass empty tighten"
-    # Hook must block (not return None) because the verdict is now BLOCK.
-    assert hook_result is not None, "HIGH-3: hook must block an empty TIGHTEN verdict"
+    # Hook must block (dict, not None) because the verdict is now BLOCK.
+    assert isinstance(hook_result, dict) and hook_result.get("action") == "block", (
+        "HIGH-3: hook must block an empty TIGHTEN verdict"
+    )
 
 
 # MED-1: audit redaction misses non-name-matched secrets
+
 
 def test_med1_audit_redacts_non_name_field_db_pass(tmp_path):
     """MED-1: field named 'DB_PASS' (not matching existing name regex) must be redacted.
@@ -634,13 +872,18 @@ def test_med1_audit_redacts_non_name_field_db_pass(tmp_path):
     path = tmp_path / "audit.jsonl"
     store = AuditStore(path)
     store.record(
-        tool_call_id="m1a", tool_name="delegate_task",
+        tool_call_id="m1a",
+        tool_name="delegate_task",
         args={"DB_PASS": "hunter2hunter2hunter2hunter2hunter2"},
-        blast_radius="elevated", decision="allow", reason="", constraints=[],
+        blast_radius="elevated",
+        decision="allow",
+        reason="",
+        constraints=[],
     )
     raw = path.read_text()
-    assert "hunter2hunter2hunter2hunter2hunter2" not in raw, \
+    assert "hunter2hunter2hunter2hunter2hunter2" not in raw, (
         "MED-1: plaintext DB_PASS value must be redacted"
+    )
 
 
 def test_med1_audit_redacts_passphrase_in_goal(tmp_path):
@@ -648,13 +891,16 @@ def test_med1_audit_redacts_passphrase_in_goal(tmp_path):
     path = tmp_path / "audit.jsonl"
     store = AuditStore(path)
     store.record(
-        tool_call_id="m1b", tool_name="delegate_task",
+        tool_call_id="m1b",
+        tool_name="delegate_task",
         args={"goal": "connect to db using passphrase=hunter2andmore"},
-        blast_radius="elevated", decision="allow", reason="", constraints=[],
+        blast_radius="elevated",
+        decision="allow",
+        reason="",
+        constraints=[],
     )
     raw = path.read_text()
-    assert "hunter2andmore" not in raw, \
-        "MED-1: embedded passphrase kv pair must be redacted"
+    assert "hunter2andmore" not in raw, "MED-1: embedded passphrase kv pair must be redacted"
 
 
 def test_med1_audit_redacts_high_entropy_blob(tmp_path):
@@ -663,15 +909,20 @@ def test_med1_audit_redacts_high_entropy_blob(tmp_path):
     store = AuditStore(path)
     secret = "A" * 40  # 40-char all-alpha blob (looks like a token)
     store.record(
-        tool_call_id="m1c", tool_name="delegate_task",
+        tool_call_id="m1c",
+        tool_name="delegate_task",
         args={"goal": f"use key {secret} to auth"},
-        blast_radius="elevated", decision="allow", reason="", constraints=[],
+        blast_radius="elevated",
+        decision="allow",
+        reason="",
+        constraints=[],
     )
     raw = path.read_text()
     assert secret not in raw, "MED-1: high-entropy blob must be redacted"
 
 
 # MED-2: gate failure must emit an explicit state line
+
 
 def test_med2_gate_active_emits_explicit_state_line(tmp_path, caplog):
     """MED-2: successful gate registration emits 'review gate: ACTIVE' log line."""
@@ -699,8 +950,9 @@ def test_med2_gate_active_emits_explicit_state_line(tmp_path, caplog):
         register_gate(_Ctx(), raw_config=raw)
 
     all_messages = " ".join(caplog.messages)
-    assert "review gate: ACTIVE" in all_messages, \
+    assert "review gate: ACTIVE" in all_messages, (
         f"MED-2: must emit 'review gate: ACTIVE'; got: {caplog.messages}"
+    )
 
 
 def test_med2_gate_disabled_emits_explicit_state_line(caplog):
@@ -710,8 +962,11 @@ def test_med2_gate_disabled_emits_explicit_state_line(caplog):
     from hermes_mpm.gate import register_gate
 
     class _Ctx:
-        def register_middleware(self, kind, callback): pass
-        def register_hook(self, hook_name, callback): pass
+        def register_middleware(self, kind, callback):
+            pass
+
+        def register_hook(self, hook_name, callback):
+            pass
 
     raw = {"hermes_mpm": {"review_gate": {"enabled": False}}}
 
@@ -719,8 +974,9 @@ def test_med2_gate_disabled_emits_explicit_state_line(caplog):
         register_gate(_Ctx(), raw_config=raw)
 
     all_messages = " ".join(caplog.messages)
-    assert "review gate: DISABLED" in all_messages, \
+    assert "review gate: DISABLED" in all_messages, (
         f"MED-2: must emit 'review gate: DISABLED'; got: {caplog.messages}"
+    )
 
 
 def test_med2_gate_failed_hook_emits_explicit_blocking_state_line(caplog):
@@ -755,8 +1011,9 @@ def test_med2_gate_failed_hook_emits_explicit_blocking_state_line(caplog):
             register_gate(_Ctx(), raw_config=raw)
 
     all_messages = " ".join(caplog.messages)
-    assert "review gate: FAILED" in all_messages or "GATE ABORTED" in all_messages, \
+    assert "review gate: FAILED" in all_messages or "GATE ABORTED" in all_messages, (
         f"MED-2: must emit 'review gate: FAILED' or 'GATE ABORTED'; got: {caplog.messages}"
+    )
 
 
 def test_med2_gate_failed_middleware_emits_explicit_blocking_state_line(caplog):
@@ -785,11 +1042,13 @@ def test_med2_gate_failed_middleware_emits_explicit_blocking_state_line(caplog):
         register_gate(_Ctx(), raw_config=raw)
 
     all_messages = " ".join(caplog.messages)
-    assert "review gate: FAILED" in all_messages or "BLOCKING ALL" in all_messages, \
+    assert "review gate: FAILED" in all_messages or "BLOCKING ALL" in all_messages, (
         f"MED-2: must emit 'review gate: FAILED' or 'BLOCKING ALL'; got: {caplog.messages}"
+    )
 
 
 # LOW-1: empty orchestrator lab must fail closed
+
 
 def test_low1_empty_orchestrator_model_fails_closed(tmp_path, caplog):
     """LOW-1: if orchestrator model is absent/empty, gate cannot verify lab independence.
@@ -826,17 +1085,21 @@ def test_low1_empty_orchestrator_model_fails_closed(tmp_path, caplog):
     warning_messages = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert warning_messages, "LOW-1: must emit a WARNING when orchestrator lab is unknown"
     combined = " ".join(r.message for r in warning_messages)
-    assert "orchestrator" in combined.lower() or "lab" in combined.lower() or \
-           "unknown" in combined.lower() or "independent" in combined.lower() or \
-           "cannot" in combined.lower(), \
-        f"LOW-1: warning must mention orchestrator/lab/unknown; got: {combined}"
+    assert (
+        "orchestrator" in combined.lower()
+        or "lab" in combined.lower()
+        or "unknown" in combined.lower()
+        or "independent" in combined.lower()
+        or "cannot" in combined.lower()
+    ), f"LOW-1: warning must mention orchestrator/lab/unknown; got: {combined}"
 
     # The gate must be fail-closed: any delegate_task call must be blocked.
     hook = registered["hooks"].get("pre_tool_call")
     assert hook is not None, "hook must be registered"
-    msg = hook("delegate_task", {"goal": "run the tests"}, tool_call_id="low1")
-    assert msg is not None, \
-        "LOW-1: gate must BLOCK when orchestrator lab cannot be determined"
+    res = hook("delegate_task", {"goal": "run the tests"}, tool_call_id="low1")
+    assert isinstance(res, dict) and res.get("action") == "block", (
+        "LOW-1: gate must BLOCK (return block dict) when orchestrator lab cannot be determined"
+    )
 
 
 def test_low1_nonempty_orchestrator_model_logs_both_labs(tmp_path, caplog):
@@ -866,8 +1129,9 @@ def test_low1_nonempty_orchestrator_model_logs_both_labs(tmp_path, caplog):
 
     combined = " ".join(caplog.messages)
     # At least one message must mention the derived labs.
-    assert "anthropic" in combined.lower() or "deepseek" in combined.lower(), \
+    assert "anthropic" in combined.lower() or "deepseek" in combined.lower(), (
         f"LOW-1 control: derived labs must appear in startup logs; got: {combined}"
+    )
 
 
 # ── CHANGE 1: Loud self-check ACTIVE line ─────────────────────────────────────
@@ -885,8 +1149,11 @@ def test_active_log_includes_reviewer_model(caplog):
     from hermes_mpm.gate import register_gate
 
     class _Ctx:
-        def register_middleware(self, kind, callback): pass
-        def register_hook(self, hook_name, callback): pass
+        def register_middleware(self, kind, callback):
+            pass
+
+        def register_hook(self, hook_name, callback):
+            pass
 
     raw = {
         "hermes_mpm": {
@@ -917,8 +1184,11 @@ def test_active_log_includes_gated_tiers(caplog):
     from hermes_mpm.gate import register_gate
 
     class _Ctx:
-        def register_middleware(self, kind, callback): pass
-        def register_hook(self, hook_name, callback): pass
+        def register_middleware(self, kind, callback):
+            pass
+
+        def register_hook(self, hook_name, callback):
+            pass
 
     raw = {
         "hermes_mpm": {
@@ -932,9 +1202,7 @@ def test_active_log_includes_gated_tiers(caplog):
     active_lines = [m for m in caplog.messages if "review gate: ACTIVE" in m]
     assert active_lines, "must emit 'review gate: ACTIVE' line"
     line = active_lines[0]
-    assert "elevated" in line, (
-        f"ACTIVE line must mention 'elevated' tier; got: {line!r}"
-    )
+    assert "elevated" in line, f"ACTIVE line must mention 'elevated' tier; got: {line!r}"
     assert "merge_adjacent" in line, (
         f"ACTIVE line must mention 'merge_adjacent' tier; got: {line!r}"
     )
@@ -954,8 +1222,11 @@ def test_active_log_includes_orchestrator_lab(caplog):
     from hermes_mpm.gate import register_gate
 
     class _Ctx:
-        def register_middleware(self, kind, callback): pass
-        def register_hook(self, hook_name, callback): pass
+        def register_middleware(self, kind, callback):
+            pass
+
+        def register_hook(self, hook_name, callback):
+            pass
 
     raw = {
         "hermes_mpm": {
@@ -993,12 +1264,24 @@ def test_outer_catch_gate_failure_logs_at_error_level(caplog):
 
     class _Ctx:
         calls: list = []
-        def register_cli_command(self, **kw): self.calls.append(("cli", kw))
-        def register_hook(self, name, fn): self.calls.append(("hook", name))
-        def register_middleware(self, kind, fn): self.calls.append(("mw", kind))
-        def register_command(self, **kw): self.calls.append(("cmd", kw))
-        def register_tool(self, **kw): self.calls.append(("tool", kw))
-        def register_skill(self, **kw): self.calls.append(("skill", kw))
+
+        def register_cli_command(self, **kw):
+            self.calls.append(("cli", kw))
+
+        def register_hook(self, name, fn):
+            self.calls.append(("hook", name))
+
+        def register_middleware(self, kind, fn):
+            self.calls.append(("mw", kind))
+
+        def register_command(self, **kw):
+            self.calls.append(("cmd", kw))
+
+        def register_tool(self, **kw):
+            self.calls.append(("tool", kw))
+
+        def register_skill(self, **kw):
+            self.calls.append(("skill", kw))
 
     ctx = _Ctx()
 
@@ -1011,9 +1294,8 @@ def test_outer_catch_gate_failure_logs_at_error_level(caplog):
             mpm_mod.register(ctx)
 
     error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
-    assert error_records, (
-        "gate arming failure must be logged at ERROR level; got records: "
-        + str([(r.levelno, r.message) for r in caplog.records])
+    assert error_records, "gate arming failure must be logged at ERROR level; got records: " + str(
+        [(r.levelno, r.message) for r in caplog.records]
     )
     combined_errors = " ".join(r.message for r in error_records)
     assert "gate" in combined_errors.lower() or "review" in combined_errors.lower(), (
@@ -1078,9 +1360,7 @@ def test_gate_status_ok_prints_reviewer_model(capsys):
     raw = _make_raw_config()
     _gate_status_handler(raw)
     out = capsys.readouterr().out
-    assert "deepseek/deepseek-v4-pro" in out, (
-        f"gate-status must print reviewer model; got: {out!r}"
-    )
+    assert "deepseek/deepseek-v4-pro" in out, f"gate-status must print reviewer model; got: {out!r}"
 
 
 def test_gate_status_ok_prints_gated_tiers(capsys):

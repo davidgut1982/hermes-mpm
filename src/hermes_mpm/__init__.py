@@ -17,7 +17,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from . import cli, intent, orchestrator, pipeline as mpm_pipeline, routing
+from . import cli, intent, orchestrator, routing
+from . import pipeline as mpm_pipeline
 
 logger = logging.getLogger("hermes_mpm")
 
@@ -102,24 +103,25 @@ def _make_pre_llm_call(cfg: dict):
 # Kept as a module constant so tests can read it without instantiating the hook.
 # Length target: <200 tokens. Do NOT add examples here — the SKILL.md has them.
 _DECOMPOSE_HINT: str = (
-    "[MPM] YOUR FIRST ACTION on every user turn: count separable subtasks. "
-    "A subtask is any distinct item, numbered point, named topic, or research angle "
-    "that can run independently. "
-    "COUNT ≥ 2 → call hermes_mpm_orchestrate NOW with all subtasks batched. "
-    "Do NOT answer inline. Do NOT use tools yourself. Orchestrate first, always. "
-    "Examples that MUST orchestrate: "
-    "  '(1) latest AI news (2) KB on MCP (3) arxiv papers (4) Anthropic headlines' → 4 subtasks; "
-    "  'find bugs: TODOs, error handling, deprecated code, perf, security' → 5 subtasks; "
-    "  'research X and look up Y' → 2 subtasks. "
+    "[MPM] When a turn needs several INDEPENDENT lookups or reads, issue them as "
+    "PARALLEL tool calls in ONE turn — multiple gh-axi/file-read/tavily-axi/lore-axi "
+    "calls together, not one per turn and not chained with &&. Two patterns: "
+    "(A) SAME-kind independent lookups (e.g. 'summarize issues 101, 202, 303', "
+    "'read these 4 files', 'search news on X, Y, Z') → emit the calls in parallel "
+    "yourself; do NOT orchestrate. "
+    "(B) Independent subtasks that each need a DIFFERENT specialist profile → call "
+    "hermes_mpm_orchestrate ONCE with all subtasks batched (parallel fan-out). "
+    "MUST orchestrate (multi-specialist): "
+    "  '(1) latest AI news (2) KB on MCP (3) arxiv papers' → search+kb+search profiles; "
+    "  'research X and look up our KB on Y' → search+kb. "
     "Profile routing: web/news/current/arxiv → profile='search'; "
     "kb/notes/knowledge → profile='kb'; ops/service/cluster → profile='ops'; "
     "code/engineering → profile='engineer'. "
-    "For search subtasks, context MUST include: "
-    "'FIRST ACTION: run in terminal NOW: tavily-axi search \"<query>\" --include-answer\\n"
-    "No KB. No MCP. Execute immediately.' "
-    "COUNT = 1 → handle directly (single topic = no fan-out). "
-    "Examples that must NOT orchestrate: 'what is the weather', 'summarize file X', "
-    "'what does our KB say about Y' (one topic). "
+    "Search subtasks resolve their query by running tavily-axi search directly "
+    "(no KB, no MCP); put that in the subtask's context so the spawned search agent "
+    "fetches the web result, not training data. "
+    "Single topic, or a message that refers to prior context ('do it', 'go ahead', "
+    "'lore it') → handle inline; don't invent subtasks or fan out. "
     "Max 5 concurrent subtasks; batch if more."
 )
 
@@ -130,11 +132,11 @@ _AXI_CHEATSHEET: str = (
     "[AXI TOOLS — run via terminal/shell, NOT MCP]\n"
     "These replace the heavy MCP servers. Use them for all web search and KB ops.\n\n"
     "WEB SEARCH (for current info, news, URLs — always use these, not training data):\n"
-    "  tavily-axi search \"<query>\" [--limit N] [--depth basic|advanced] [--include-answer]\n"
-    "  exa-axi search \"<query>\" [--limit N] [--type auto|text|url]\n"
+    '  tavily-axi search "<query>" [--limit N] [--depth basic|advanced] [--include-answer]\n'
+    '  exa-axi search "<query>" [--limit N] [--type auto|text|url]\n'
     "  exa-axi similar <url>  # find pages similar to a URL\n\n"
     "KNOWLEDGE BASE (Lore — stored project/config knowledge):\n"
-    "  lore-axi kb-search \"<query>\" [--hybrid] [--limit 20]\n"
+    '  lore-axi kb-search "<query>" [--hybrid] [--limit 20]\n'
     "  lore-axi kb-add <topic> <title> <content>\n"
     "  lore-axi kb-get <id>\n\n"
     "GITHUB:\n"
@@ -144,7 +146,7 @@ _AXI_CHEATSHEET: str = (
     "  cluster-ops-axi service <host> <unit>\n"
     "  cluster-ops-axi exec <host> <command>\n\n"
     "OTHER:\n"
-    "  weather-axi current \"<location>\" | forecast \"<location>\" [--days N]\n"
+    '  weather-axi current "<location>" | forecast "<location>" [--days N]\n'
     "  ocr-axi image <path> | pdf-text <path>\n\n"
     "ROUTING: web/news/current events → tavily-axi or exa-axi; "
     "stored knowledge → lore-axi kb-search; ops → cluster-ops-axi."
@@ -173,8 +175,43 @@ def _make_decompose_hint_hook():
     def hint_hook(**kw) -> dict | None:
         platform = (kw.get("platform") or "").lower()
         # Suppress on subagent turns — children should not receive PM instructions.
+        # Clear any captured agent so a child turn cannot read a stale parent agent.
         if platform in ("subagent", "leaf"):
+            try:
+                orchestrator.clear_agent()
+            except Exception:
+                pass
             return None
+        # Suppress on short / referential messages. These are almost always a
+        # single action tied to prior conversation context ("lore it", "do it",
+        # "yes", "go ahead", "continue"), NOT a multi-part request. Injecting
+        # fan-out pressure here causes the model to invent subtasks the user
+        # never asked for — a direct hallucination trigger.
+        #
+        # Finding 3(a): clear the captured agent on these short turns too — the
+        # capture below is skipped here, so without an explicit clear a short
+        # referential turn would inherit a STALE agent captured by a prior turn.
+        msg = kw.get("user_message") or ""
+        if len(msg.strip().split()) <= 6:
+            try:
+                orchestrator.clear_agent()
+            except Exception:
+                pass
+            return None
+        # Capture the live agent (per-context contextvar) so orchestrator.handle()
+        # can inject it as parent_agent when dispatching delegate_task. The plugin
+        # tool dispatch path does not pass parent_agent; this pre_llm_call hook
+        # fires before every LLM response (and therefore before any tool call in
+        # the turn), so the captured agent is fresh when hermes_mpm_orchestrate
+        # runs. If no agent is provided, clear so a prior turn's agent can't leak.
+        _agent = kw.get("agent")
+        try:
+            if _agent is not None:
+                orchestrator.capture_agent(_agent)
+            else:
+                orchestrator.clear_agent()
+        except Exception:
+            pass  # never break the turn
         return {"context": _DECOMPOSE_HINT}
 
     hint_hook.__name__ = "hermes_mpm_decompose_hint"
@@ -323,22 +360,45 @@ def register(ctx) -> None:
     except Exception as exc:
         logger.warning("hermes-mpm: orchestrate tool registration failed: %s", exc)
 
-
     # 3b) Pipeline tools — 6-stage quality gate for bug fixes.
     try:
         _PIPELINE_TOOLS = [
-            (mpm_pipeline.INIT_SCHEMA, mpm_pipeline.handle_init,
-             "Initialize a new pipeline run with state tracking.", "🚀"),
-            (mpm_pipeline.TRANSITION_SCHEMA, mpm_pipeline.handle_transition,
-             "Transition pipeline to the next phase.", "⏩"),
-            (mpm_pipeline.RECORD_EVIDENCE_SCHEMA, mpm_pipeline.handle_record_evidence,
-             "Record gate evidence for the current phase.", "📋"),
-            (mpm_pipeline.VERIFY_GATE_SCHEMA, mpm_pipeline.handle_verify_gate,
-             "Verify that a phase gate has passed.", "✅"),
-            (mpm_pipeline.STATUS_SCHEMA, mpm_pipeline.handle_status,
-             "Show current pipeline state.", "📊"),
-            (mpm_pipeline.RECOVER_SCHEMA, mpm_pipeline.handle_recover,
-             "Handle pipeline failure (retry/skip/escalate).", "🔄"),
+            (
+                mpm_pipeline.INIT_SCHEMA,
+                mpm_pipeline.handle_init,
+                "Initialize a new pipeline run with state tracking.",
+                "🚀",
+            ),
+            (
+                mpm_pipeline.TRANSITION_SCHEMA,
+                mpm_pipeline.handle_transition,
+                "Transition pipeline to the next phase.",
+                "⏩",
+            ),
+            (
+                mpm_pipeline.RECORD_EVIDENCE_SCHEMA,
+                mpm_pipeline.handle_record_evidence,
+                "Record gate evidence for the current phase.",
+                "📋",
+            ),
+            (
+                mpm_pipeline.VERIFY_GATE_SCHEMA,
+                mpm_pipeline.handle_verify_gate,
+                "Verify that a phase gate has passed.",
+                "✅",
+            ),
+            (
+                mpm_pipeline.STATUS_SCHEMA,
+                mpm_pipeline.handle_status,
+                "Show current pipeline state.",
+                "📊",
+            ),
+            (
+                mpm_pipeline.RECOVER_SCHEMA,
+                mpm_pipeline.handle_recover,
+                "Handle pipeline failure (retry/skip/escalate).",
+                "🔄",
+            ),
         ]
         for _schema, _handler, _desc, _emoji in _PIPELINE_TOOLS:
             try:
