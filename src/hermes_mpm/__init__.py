@@ -17,7 +17,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from . import cli, intent, orchestrator, pipeline as mpm_pipeline, routing
+from . import cli, intent, orchestrator, routing
+from . import pipeline as mpm_pipeline
 
 logger = logging.getLogger("hermes_mpm")
 
@@ -131,11 +132,11 @@ _AXI_CHEATSHEET: str = (
     "[AXI TOOLS — run via terminal/shell, NOT MCP]\n"
     "These replace the heavy MCP servers. Use them for all web search and KB ops.\n\n"
     "WEB SEARCH (for current info, news, URLs — always use these, not training data):\n"
-    "  tavily-axi search \"<query>\" [--limit N] [--depth basic|advanced] [--include-answer]\n"
-    "  exa-axi search \"<query>\" [--limit N] [--type auto|text|url]\n"
+    '  tavily-axi search "<query>" [--limit N] [--depth basic|advanced] [--include-answer]\n'
+    '  exa-axi search "<query>" [--limit N] [--type auto|text|url]\n'
     "  exa-axi similar <url>  # find pages similar to a URL\n\n"
     "KNOWLEDGE BASE (Lore — stored project/config knowledge):\n"
-    "  lore-axi kb-search \"<query>\" [--hybrid] [--limit 20]\n"
+    '  lore-axi kb-search "<query>" [--hybrid] [--limit 20]\n'
     "  lore-axi kb-add <topic> <title> <content>\n"
     "  lore-axi kb-get <id>\n\n"
     "GITHUB:\n"
@@ -145,7 +146,7 @@ _AXI_CHEATSHEET: str = (
     "  cluster-ops-axi service <host> <unit>\n"
     "  cluster-ops-axi exec <host> <command>\n\n"
     "OTHER:\n"
-    "  weather-axi current \"<location>\" | forecast \"<location>\" [--days N]\n"
+    '  weather-axi current "<location>" | forecast "<location>" [--days N]\n'
     "  ocr-axi image <path> | pdf-text <path>\n\n"
     "ROUTING: web/news/current events → tavily-axi or exa-axi; "
     "stored knowledge → lore-axi kb-search; ops → cluster-ops-axi."
@@ -190,7 +191,7 @@ def _make_decompose_hint_hook():
         # Finding 3(a): clear the captured agent on these short turns too — the
         # capture below is skipped here, so without an explicit clear a short
         # referential turn would inherit a STALE agent captured by a prior turn.
-        msg = (kw.get("user_message") or "")
+        msg = kw.get("user_message") or ""
         if len(msg.strip().split()) <= 6:
             try:
                 orchestrator.clear_agent()
@@ -359,22 +360,45 @@ def register(ctx) -> None:
     except Exception as exc:
         logger.warning("hermes-mpm: orchestrate tool registration failed: %s", exc)
 
-
     # 3b) Pipeline tools — 6-stage quality gate for bug fixes.
     try:
         _PIPELINE_TOOLS = [
-            (mpm_pipeline.INIT_SCHEMA, mpm_pipeline.handle_init,
-             "Initialize a new pipeline run with state tracking.", "🚀"),
-            (mpm_pipeline.TRANSITION_SCHEMA, mpm_pipeline.handle_transition,
-             "Transition pipeline to the next phase.", "⏩"),
-            (mpm_pipeline.RECORD_EVIDENCE_SCHEMA, mpm_pipeline.handle_record_evidence,
-             "Record gate evidence for the current phase.", "📋"),
-            (mpm_pipeline.VERIFY_GATE_SCHEMA, mpm_pipeline.handle_verify_gate,
-             "Verify that a phase gate has passed.", "✅"),
-            (mpm_pipeline.STATUS_SCHEMA, mpm_pipeline.handle_status,
-             "Show current pipeline state.", "📊"),
-            (mpm_pipeline.RECOVER_SCHEMA, mpm_pipeline.handle_recover,
-             "Handle pipeline failure (retry/skip/escalate).", "🔄"),
+            (
+                mpm_pipeline.INIT_SCHEMA,
+                mpm_pipeline.handle_init,
+                "Initialize a new pipeline run with state tracking.",
+                "🚀",
+            ),
+            (
+                mpm_pipeline.TRANSITION_SCHEMA,
+                mpm_pipeline.handle_transition,
+                "Transition pipeline to the next phase.",
+                "⏩",
+            ),
+            (
+                mpm_pipeline.RECORD_EVIDENCE_SCHEMA,
+                mpm_pipeline.handle_record_evidence,
+                "Record gate evidence for the current phase.",
+                "📋",
+            ),
+            (
+                mpm_pipeline.VERIFY_GATE_SCHEMA,
+                mpm_pipeline.handle_verify_gate,
+                "Verify that a phase gate has passed.",
+                "✅",
+            ),
+            (
+                mpm_pipeline.STATUS_SCHEMA,
+                mpm_pipeline.handle_status,
+                "Show current pipeline state.",
+                "📊",
+            ),
+            (
+                mpm_pipeline.RECOVER_SCHEMA,
+                mpm_pipeline.handle_recover,
+                "Handle pipeline failure (retry/skip/escalate).",
+                "🔄",
+            ),
         ]
         for _schema, _handler, _desc, _emoji in _PIPELINE_TOOLS:
             try:

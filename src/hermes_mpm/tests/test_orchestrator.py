@@ -251,10 +251,13 @@ def _set_gate(verdict_for):
     What: patches gate_adapter.evaluate; verdict_for(goal) returns a Verdict.
     Test: used by the Finding-2 tests below.
     """
+
     def _fake_evaluate(tool_name, args, tool_call_id=None):
-        goal = ((args.get("tasks") or [{}])[0].get("goal")
-                if args.get("tasks") else args.get("goal")) or ""
+        goal = (
+            (args.get("tasks") or [{}])[0].get("goal") if args.get("tasks") else args.get("goal")
+        ) or ""
         return verdict_for(goal)
+
     return patch.object(gate_adapter, "evaluate", side_effect=_fake_evaluate)
 
 
@@ -276,13 +279,17 @@ def test_blockable_subtask_is_skipped(tmp_path):
         return Verdict(decision="allow")
 
     with _set_gate(verdict_for):
-        out = json.loads(orchestrator.handle({
-            "goal": "mixed batch",
-            "subtasks": [
-                {"profile": "ops", "goal": "delete prod database"},
-                {"profile": "ops", "goal": "list status"},
-            ],
-        }))
+        out = json.loads(
+            orchestrator.handle(
+                {
+                    "goal": "mixed batch",
+                    "subtasks": [
+                        {"profile": "ops", "goal": "delete prod database"},
+                        {"profile": "ops", "goal": "list status"},
+                    ],
+                }
+            )
+        )
 
     # Exactly one dispatch, carrying only the allowed subtask.
     assert len(ctx.calls) == 1, "one batched dispatch for the surviving subtask"
@@ -305,13 +312,17 @@ def test_all_subtasks_blocked_no_dispatch(tmp_path):
     orchestrator.set_ctx(ctx)
 
     with _set_gate(lambda goal: Verdict(decision="block", reason="nope")):
-        out = json.loads(orchestrator.handle({
-            "goal": "all dangerous",
-            "subtasks": [
-                {"profile": "ops", "goal": "delete a"},
-                {"profile": "ops", "goal": "drop b"},
-            ],
-        }))
+        out = json.loads(
+            orchestrator.handle(
+                {
+                    "goal": "all dangerous",
+                    "subtasks": [
+                        {"profile": "ops", "goal": "delete a"},
+                        {"profile": "ops", "goal": "drop b"},
+                    ],
+                }
+            )
+        )
 
     assert len(ctx.calls) == 0, "no dispatch when every subtask is blocked"
     assert out.get("blocked"), "result must list the blocked subtasks"
@@ -329,13 +340,17 @@ def test_allowed_subtasks_dispatch_normally(tmp_path):
     orchestrator.set_ctx(ctx)
 
     with _set_gate(lambda goal: Verdict(decision="allow")):
-        out = json.loads(orchestrator.handle({
-            "goal": "safe batch",
-            "subtasks": [
-                {"profile": "ops", "goal": "check plex"},
-                {"profile": "ops", "goal": "check disk"},
-            ],
-        }))
+        out = json.loads(
+            orchestrator.handle(
+                {
+                    "goal": "safe batch",
+                    "subtasks": [
+                        {"profile": "ops", "goal": "check plex"},
+                        {"profile": "ops", "goal": "check disk"},
+                    ],
+                }
+            )
+        )
 
     assert len(ctx.calls) == 1
     _, args, _ = ctx.calls[0]
@@ -392,10 +407,12 @@ def test_short_turn_does_not_read_stale_agent(tmp_path):
     orchestrator.set_ctx(ctx)
 
     with _set_gate(lambda goal: Verdict(decision="allow")):
-        orchestrator.handle({
-            "goal": "safe",
-            "subtasks": [{"profile": "ops", "goal": "list status"}],
-        })
+        orchestrator.handle(
+            {
+                "goal": "safe",
+                "subtasks": [{"profile": "ops", "goal": "list status"}],
+            }
+        )
 
     # No captured agent → fell back to ctx.dispatch_tool (one recorded call).
     assert len(ctx.calls) == 1, "fallback dispatch path must run when no agent captured"

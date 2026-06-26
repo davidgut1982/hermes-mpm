@@ -175,6 +175,7 @@ def test_tighten_list_item_removed_invalid():
 # ''.startswith('') is True, so base="" let any proposed value pass the prefix
 # check. Fix: if base is empty and proposed is non-empty -> invalid.
 
+
 def test_tighten_finding2_empty_base_nonempty_proposed_invalid():
     """Finding 2: base='' and proposed='inject' must be invalid (not vacuously pass).
 
@@ -208,6 +209,7 @@ def test_tighten_finding2_nonempty_base_startswith_passes():
 # validate_tighten({'goal':'x'}, {'goal':42}) -> ok (isinstance guards no-op on
 # type mismatch). Fix: check type(base_val) is type(prop_val) before isinstance.
 
+
 def test_tighten_finding3_str_to_int_invalid():
     """Finding 3: str->int type change must be invalid.
 
@@ -231,9 +233,7 @@ def test_tighten_finding3_str_to_list_invalid():
 
 def test_tighten_finding3_list_to_dict_invalid():
     """Finding 3: list->dict type change must be invalid."""
-    ok, reason = tighten_mod.validate_tighten(
-        {"constraints": ["a"]}, {"constraints": {"a": "b"}}
-    )
+    ok, reason = tighten_mod.validate_tighten({"constraints": ["a"]}, {"constraints": {"a": "b"}})
     assert ok is False, "Finding 3: list->dict type change must be invalid"
 
 
@@ -247,8 +247,9 @@ def test_tighten_finding3_same_type_still_valid():
 
 
 def _make_adapter(tmp_path, *, enabled=True, fail_closed=True):
-    cfg = ReviewGateConfig(enabled=enabled, fail_closed=fail_closed,
-                           audit_path=tmp_path / "audit.jsonl")
+    cfg = ReviewGateConfig(
+        enabled=enabled, fail_closed=fail_closed, audit_path=tmp_path / "audit.jsonl"
+    )
     store = AuditStore(tmp_path / "audit.jsonl")
     return ReviewGateAdapter(cfg, store)
 
@@ -350,9 +351,7 @@ def test_hook_callback_full_review_path_allow(tmp_path):
     assert mock_call.call_count == 1, (
         f"reviewer must be called once on a cold gated call; got {mock_call.call_count}"
     )
-    assert result is None, (
-        f"ALLOW verdict must produce None (no block); got {result!r}"
-    )
+    assert result is None, f"ALLOW verdict must produce None (no block); got {result!r}"
 
 
 def test_hook_callback_full_review_path_block(tmp_path):
@@ -368,7 +367,9 @@ def test_hook_callback_full_review_path_block(tmp_path):
     adapter = _make_adapter(tmp_path)
     args = {"goal": "delete all production records"}  # elevated → gated
 
-    with patch("hermes_mpm.gate.adapter.call_reviewer", return_value="BLOCK: too risky") as mock_call:
+    with patch(
+        "hermes_mpm.gate.adapter.call_reviewer", return_value="BLOCK: too risky"
+    ) as mock_call:
         result = adapter.hook_callback(
             tool_name="delegate_task", args=args, tool_call_id="full-review-block"
         )
@@ -383,7 +384,7 @@ def test_hook_callback_full_review_path_block(tmp_path):
 
 
 def test_hook_callback_full_review_path_tighten_returns_none(tmp_path):
-    """hook_callback returns None on TIGHTEN (block path does not apply constraints; middleware does).
+    """hook_callback returns None on TIGHTEN (block path applies no constraints; middleware does).
 
     Why: The hook is the block seam only. On TIGHTEN verdict the hook returns None
     (allow-through) because constraints are applied by middleware_callback, not here.
@@ -393,8 +394,9 @@ def test_hook_callback_full_review_path_tighten_returns_none(tmp_path):
     adapter = _make_adapter(tmp_path)
     args = {"goal": "rotate the auth keys"}  # elevated → gated
 
-    with patch("hermes_mpm.gate.adapter.call_reviewer",
-               return_value="TIGHTEN: limit scope to staging only") as mock_call:
+    with patch(
+        "hermes_mpm.gate.adapter.call_reviewer", return_value="TIGHTEN: limit scope to staging only"
+    ) as mock_call:
         result = adapter.hook_callback(
             tool_name="delegate_task", args=args, tool_call_id="full-review-tighten"
         )
@@ -462,8 +464,9 @@ def test_engine_seam_drops_bare_string_proof():
     What: feeding a bare string through the engine loop yields None (no block).
     Test: _engine_block_message(["[review-gate] BLOCKED: x"]) is None.
     """
-    assert _engine_block_message(["[review-gate] BLOCKED: x"]) is None, \
+    assert _engine_block_message(["[review-gate] BLOCKED: x"]) is None, (
         "a bare string must be dropped by the engine (this is the bug Finding 1 fixes)"
+    )
 
 
 # ── 4d. SHARED evaluate() — single source of truth (Finding 1 + Finding 2) ────
@@ -566,9 +569,15 @@ def test_adapter_batch_reviews_each_task(tmp_path):
 def test_audit_redacts_api_key(tmp_path):
     path = tmp_path / "audit.jsonl"
     store = AuditStore(path)
-    store.record(tool_call_id="t1", tool_name="delegate_task",
-                 args={"api_key": "sk-abc123", "goal": "x"},
-                 blast_radius="elevated", decision="allow", reason="", constraints=[])
+    store.record(
+        tool_call_id="t1",
+        tool_name="delegate_task",
+        args={"api_key": "sk-abc123", "goal": "x"},
+        blast_radius="elevated",
+        decision="allow",
+        reason="",
+        constraints=[],
+    )
     raw = path.read_text()
     assert "sk-abc123" not in raw
     assert "<REDACTED>" in raw
@@ -577,9 +586,15 @@ def test_audit_redacts_api_key(tmp_path):
 def test_audit_redacts_token(tmp_path):
     path = tmp_path / "audit.jsonl"
     store = AuditStore(path)
-    store.record(tool_call_id="t2", tool_name="delegate_task",
-                 args={"token": "bearer-xyz-secret", "goal": "x"},
-                 blast_radius="elevated", decision="allow", reason="", constraints=[])
+    store.record(
+        tool_call_id="t2",
+        tool_name="delegate_task",
+        args={"token": "bearer-xyz-secret", "goal": "x"},
+        blast_radius="elevated",
+        decision="allow",
+        reason="",
+        constraints=[],
+    )
     raw = path.read_text()
     assert "bearer-xyz-secret" not in raw
     assert "<REDACTED>" in raw
@@ -588,9 +603,15 @@ def test_audit_redacts_token(tmp_path):
 def test_audit_all_fields_present(tmp_path):
     path = tmp_path / "audit.jsonl"
     store = AuditStore(path)
-    store.record(tool_call_id="t3", tool_name="delegate_task",
-                 args={"goal": "x"}, blast_radius="elevated",
-                 decision="tighten", reason="added constraint", constraints=["no deletes"])
+    store.record(
+        tool_call_id="t3",
+        tool_name="delegate_task",
+        args={"goal": "x"},
+        blast_radius="elevated",
+        decision="tighten",
+        reason="added constraint",
+        constraints=["no deletes"],
+    )
     rec = json.loads(path.read_text().strip().splitlines()[-1])
     assert rec["tool_call_id"] == "t3"
     assert rec["decision"] == "tighten"
@@ -610,8 +631,7 @@ def test_config_empty_defaults():
 
 
 def test_config_partial_override():
-    raw = {"hermes_mpm": {"review_gate": {"enabled": False,
-                                          "reviewer": {"model": "openai/gpt-x"}}}}
+    raw = {"hermes_mpm": {"review_gate": {"enabled": False, "reviewer": {"model": "openai/gpt-x"}}}}
     cfg = config_mod.load_gate_config(raw)
     assert cfg.enabled is False
     assert cfg.reviewer_model == "openai/gpt-x"
@@ -624,6 +644,7 @@ def test_config_partial_override():
 # HIGH-1: tighten-only prefix bypass
 # A rewritten string that is LONGER than the base but does not START WITH it
 # must be rejected. The original code only checks length, not prefix.
+
 
 def test_high1_tighten_rewrite_longer_but_diverges_is_invalid():
     """HIGH-1: longer value that does not start with the base must be rejected.
@@ -683,6 +704,7 @@ def test_high1_tighten_prefix_check_on_substance_keys():
 #      registered. The failure is visible in logs, not silent.
 #   2. Register middleware AFTER the hook. If it fails, the hook alone can block
 #      all delegate_task calls. Flip adapter to fail-closed; emit FAILED state.
+
 
 def test_high2_hook_registration_failure_aborts_gate(tmp_path):
     """HIGH-2 (Finding 1): if register_hook raises, register_gate must raise GateArmingError.
@@ -793,6 +815,7 @@ def test_high2_middleware_registration_failure_hook_blocks(tmp_path):
 
 # HIGH-3: empty TIGHTEN: is a silent ALLOW
 
+
 def test_high3_empty_tighten_parses_as_block():
     """HIGH-3: 'TIGHTEN:' with no constraint text must parse as BLOCK, not tighten.
 
@@ -830,11 +853,13 @@ def test_high3_adapter_blocks_empty_tighten_verdict(tmp_path):
     # Middleware must not apply empty constraints (returns None = no mutation).
     assert mw_result is None, "HIGH-3: middleware must not pass empty tighten"
     # Hook must block (dict, not None) because the verdict is now BLOCK.
-    assert isinstance(hook_result, dict) and hook_result.get("action") == "block", \
+    assert isinstance(hook_result, dict) and hook_result.get("action") == "block", (
         "HIGH-3: hook must block an empty TIGHTEN verdict"
+    )
 
 
 # MED-1: audit redaction misses non-name-matched secrets
+
 
 def test_med1_audit_redacts_non_name_field_db_pass(tmp_path):
     """MED-1: field named 'DB_PASS' (not matching existing name regex) must be redacted.
@@ -847,13 +872,18 @@ def test_med1_audit_redacts_non_name_field_db_pass(tmp_path):
     path = tmp_path / "audit.jsonl"
     store = AuditStore(path)
     store.record(
-        tool_call_id="m1a", tool_name="delegate_task",
+        tool_call_id="m1a",
+        tool_name="delegate_task",
         args={"DB_PASS": "hunter2hunter2hunter2hunter2hunter2"},
-        blast_radius="elevated", decision="allow", reason="", constraints=[],
+        blast_radius="elevated",
+        decision="allow",
+        reason="",
+        constraints=[],
     )
     raw = path.read_text()
-    assert "hunter2hunter2hunter2hunter2hunter2" not in raw, \
+    assert "hunter2hunter2hunter2hunter2hunter2" not in raw, (
         "MED-1: plaintext DB_PASS value must be redacted"
+    )
 
 
 def test_med1_audit_redacts_passphrase_in_goal(tmp_path):
@@ -861,13 +891,16 @@ def test_med1_audit_redacts_passphrase_in_goal(tmp_path):
     path = tmp_path / "audit.jsonl"
     store = AuditStore(path)
     store.record(
-        tool_call_id="m1b", tool_name="delegate_task",
+        tool_call_id="m1b",
+        tool_name="delegate_task",
         args={"goal": "connect to db using passphrase=hunter2andmore"},
-        blast_radius="elevated", decision="allow", reason="", constraints=[],
+        blast_radius="elevated",
+        decision="allow",
+        reason="",
+        constraints=[],
     )
     raw = path.read_text()
-    assert "hunter2andmore" not in raw, \
-        "MED-1: embedded passphrase kv pair must be redacted"
+    assert "hunter2andmore" not in raw, "MED-1: embedded passphrase kv pair must be redacted"
 
 
 def test_med1_audit_redacts_high_entropy_blob(tmp_path):
@@ -876,15 +909,20 @@ def test_med1_audit_redacts_high_entropy_blob(tmp_path):
     store = AuditStore(path)
     secret = "A" * 40  # 40-char all-alpha blob (looks like a token)
     store.record(
-        tool_call_id="m1c", tool_name="delegate_task",
+        tool_call_id="m1c",
+        tool_name="delegate_task",
         args={"goal": f"use key {secret} to auth"},
-        blast_radius="elevated", decision="allow", reason="", constraints=[],
+        blast_radius="elevated",
+        decision="allow",
+        reason="",
+        constraints=[],
     )
     raw = path.read_text()
     assert secret not in raw, "MED-1: high-entropy blob must be redacted"
 
 
 # MED-2: gate failure must emit an explicit state line
+
 
 def test_med2_gate_active_emits_explicit_state_line(tmp_path, caplog):
     """MED-2: successful gate registration emits 'review gate: ACTIVE' log line."""
@@ -912,8 +950,9 @@ def test_med2_gate_active_emits_explicit_state_line(tmp_path, caplog):
         register_gate(_Ctx(), raw_config=raw)
 
     all_messages = " ".join(caplog.messages)
-    assert "review gate: ACTIVE" in all_messages, \
+    assert "review gate: ACTIVE" in all_messages, (
         f"MED-2: must emit 'review gate: ACTIVE'; got: {caplog.messages}"
+    )
 
 
 def test_med2_gate_disabled_emits_explicit_state_line(caplog):
@@ -923,8 +962,11 @@ def test_med2_gate_disabled_emits_explicit_state_line(caplog):
     from hermes_mpm.gate import register_gate
 
     class _Ctx:
-        def register_middleware(self, kind, callback): pass
-        def register_hook(self, hook_name, callback): pass
+        def register_middleware(self, kind, callback):
+            pass
+
+        def register_hook(self, hook_name, callback):
+            pass
 
     raw = {"hermes_mpm": {"review_gate": {"enabled": False}}}
 
@@ -932,8 +974,9 @@ def test_med2_gate_disabled_emits_explicit_state_line(caplog):
         register_gate(_Ctx(), raw_config=raw)
 
     all_messages = " ".join(caplog.messages)
-    assert "review gate: DISABLED" in all_messages, \
+    assert "review gate: DISABLED" in all_messages, (
         f"MED-2: must emit 'review gate: DISABLED'; got: {caplog.messages}"
+    )
 
 
 def test_med2_gate_failed_hook_emits_explicit_blocking_state_line(caplog):
@@ -968,8 +1011,9 @@ def test_med2_gate_failed_hook_emits_explicit_blocking_state_line(caplog):
             register_gate(_Ctx(), raw_config=raw)
 
     all_messages = " ".join(caplog.messages)
-    assert "review gate: FAILED" in all_messages or "GATE ABORTED" in all_messages, \
+    assert "review gate: FAILED" in all_messages or "GATE ABORTED" in all_messages, (
         f"MED-2: must emit 'review gate: FAILED' or 'GATE ABORTED'; got: {caplog.messages}"
+    )
 
 
 def test_med2_gate_failed_middleware_emits_explicit_blocking_state_line(caplog):
@@ -998,11 +1042,13 @@ def test_med2_gate_failed_middleware_emits_explicit_blocking_state_line(caplog):
         register_gate(_Ctx(), raw_config=raw)
 
     all_messages = " ".join(caplog.messages)
-    assert "review gate: FAILED" in all_messages or "BLOCKING ALL" in all_messages, \
+    assert "review gate: FAILED" in all_messages or "BLOCKING ALL" in all_messages, (
         f"MED-2: must emit 'review gate: FAILED' or 'BLOCKING ALL'; got: {caplog.messages}"
+    )
 
 
 # LOW-1: empty orchestrator lab must fail closed
+
 
 def test_low1_empty_orchestrator_model_fails_closed(tmp_path, caplog):
     """LOW-1: if orchestrator model is absent/empty, gate cannot verify lab independence.
@@ -1039,17 +1085,21 @@ def test_low1_empty_orchestrator_model_fails_closed(tmp_path, caplog):
     warning_messages = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert warning_messages, "LOW-1: must emit a WARNING when orchestrator lab is unknown"
     combined = " ".join(r.message for r in warning_messages)
-    assert "orchestrator" in combined.lower() or "lab" in combined.lower() or \
-           "unknown" in combined.lower() or "independent" in combined.lower() or \
-           "cannot" in combined.lower(), \
-        f"LOW-1: warning must mention orchestrator/lab/unknown; got: {combined}"
+    assert (
+        "orchestrator" in combined.lower()
+        or "lab" in combined.lower()
+        or "unknown" in combined.lower()
+        or "independent" in combined.lower()
+        or "cannot" in combined.lower()
+    ), f"LOW-1: warning must mention orchestrator/lab/unknown; got: {combined}"
 
     # The gate must be fail-closed: any delegate_task call must be blocked.
     hook = registered["hooks"].get("pre_tool_call")
     assert hook is not None, "hook must be registered"
     res = hook("delegate_task", {"goal": "run the tests"}, tool_call_id="low1")
-    assert isinstance(res, dict) and res.get("action") == "block", \
+    assert isinstance(res, dict) and res.get("action") == "block", (
         "LOW-1: gate must BLOCK (return block dict) when orchestrator lab cannot be determined"
+    )
 
 
 def test_low1_nonempty_orchestrator_model_logs_both_labs(tmp_path, caplog):
@@ -1079,8 +1129,9 @@ def test_low1_nonempty_orchestrator_model_logs_both_labs(tmp_path, caplog):
 
     combined = " ".join(caplog.messages)
     # At least one message must mention the derived labs.
-    assert "anthropic" in combined.lower() or "deepseek" in combined.lower(), \
+    assert "anthropic" in combined.lower() or "deepseek" in combined.lower(), (
         f"LOW-1 control: derived labs must appear in startup logs; got: {combined}"
+    )
 
 
 # ── CHANGE 1: Loud self-check ACTIVE line ─────────────────────────────────────
@@ -1098,8 +1149,11 @@ def test_active_log_includes_reviewer_model(caplog):
     from hermes_mpm.gate import register_gate
 
     class _Ctx:
-        def register_middleware(self, kind, callback): pass
-        def register_hook(self, hook_name, callback): pass
+        def register_middleware(self, kind, callback):
+            pass
+
+        def register_hook(self, hook_name, callback):
+            pass
 
     raw = {
         "hermes_mpm": {
@@ -1130,8 +1184,11 @@ def test_active_log_includes_gated_tiers(caplog):
     from hermes_mpm.gate import register_gate
 
     class _Ctx:
-        def register_middleware(self, kind, callback): pass
-        def register_hook(self, hook_name, callback): pass
+        def register_middleware(self, kind, callback):
+            pass
+
+        def register_hook(self, hook_name, callback):
+            pass
 
     raw = {
         "hermes_mpm": {
@@ -1145,9 +1202,7 @@ def test_active_log_includes_gated_tiers(caplog):
     active_lines = [m for m in caplog.messages if "review gate: ACTIVE" in m]
     assert active_lines, "must emit 'review gate: ACTIVE' line"
     line = active_lines[0]
-    assert "elevated" in line, (
-        f"ACTIVE line must mention 'elevated' tier; got: {line!r}"
-    )
+    assert "elevated" in line, f"ACTIVE line must mention 'elevated' tier; got: {line!r}"
     assert "merge_adjacent" in line, (
         f"ACTIVE line must mention 'merge_adjacent' tier; got: {line!r}"
     )
@@ -1167,8 +1222,11 @@ def test_active_log_includes_orchestrator_lab(caplog):
     from hermes_mpm.gate import register_gate
 
     class _Ctx:
-        def register_middleware(self, kind, callback): pass
-        def register_hook(self, hook_name, callback): pass
+        def register_middleware(self, kind, callback):
+            pass
+
+        def register_hook(self, hook_name, callback):
+            pass
 
     raw = {
         "hermes_mpm": {
@@ -1206,12 +1264,24 @@ def test_outer_catch_gate_failure_logs_at_error_level(caplog):
 
     class _Ctx:
         calls: list = []
-        def register_cli_command(self, **kw): self.calls.append(("cli", kw))
-        def register_hook(self, name, fn): self.calls.append(("hook", name))
-        def register_middleware(self, kind, fn): self.calls.append(("mw", kind))
-        def register_command(self, **kw): self.calls.append(("cmd", kw))
-        def register_tool(self, **kw): self.calls.append(("tool", kw))
-        def register_skill(self, **kw): self.calls.append(("skill", kw))
+
+        def register_cli_command(self, **kw):
+            self.calls.append(("cli", kw))
+
+        def register_hook(self, name, fn):
+            self.calls.append(("hook", name))
+
+        def register_middleware(self, kind, fn):
+            self.calls.append(("mw", kind))
+
+        def register_command(self, **kw):
+            self.calls.append(("cmd", kw))
+
+        def register_tool(self, **kw):
+            self.calls.append(("tool", kw))
+
+        def register_skill(self, **kw):
+            self.calls.append(("skill", kw))
 
     ctx = _Ctx()
 
@@ -1224,9 +1294,8 @@ def test_outer_catch_gate_failure_logs_at_error_level(caplog):
             mpm_mod.register(ctx)
 
     error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
-    assert error_records, (
-        "gate arming failure must be logged at ERROR level; got records: "
-        + str([(r.levelno, r.message) for r in caplog.records])
+    assert error_records, "gate arming failure must be logged at ERROR level; got records: " + str(
+        [(r.levelno, r.message) for r in caplog.records]
     )
     combined_errors = " ".join(r.message for r in error_records)
     assert "gate" in combined_errors.lower() or "review" in combined_errors.lower(), (
@@ -1291,9 +1360,7 @@ def test_gate_status_ok_prints_reviewer_model(capsys):
     raw = _make_raw_config()
     _gate_status_handler(raw)
     out = capsys.readouterr().out
-    assert "deepseek/deepseek-v4-pro" in out, (
-        f"gate-status must print reviewer model; got: {out!r}"
-    )
+    assert "deepseek/deepseek-v4-pro" in out, f"gate-status must print reviewer model; got: {out!r}"
 
 
 def test_gate_status_ok_prints_gated_tiers(capsys):

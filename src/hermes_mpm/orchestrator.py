@@ -273,10 +273,12 @@ def handle(args: Dict[str, Any], **_kwargs) -> str:
         logger.warning(
             "hermes-mpm orchestrate: all %d subtask(s) blocked by review gate", len(blocked)
         )
-        return json.dumps({
-            "error": "all subtasks blocked by review gate",
-            "blocked": blocked,
-        })
+        return json.dumps(
+            {
+                "error": "all subtasks blocked by review gate",
+                "blocked": blocked,
+            }
+        )
 
     payload = {"tasks": allowed, "role": LEAF_ROLE}
 

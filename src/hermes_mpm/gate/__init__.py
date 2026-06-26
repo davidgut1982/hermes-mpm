@@ -139,7 +139,8 @@ def register_gate(ctx, *, raw_config: dict | None = None) -> None:
     # Log derived labs at startup so operators can verify cross-lab independence.
     logger.info(
         "hermes-mpm gate: orchestrator_lab=%r reviewer_lab=%r",
-        orchestrator_lab or "(unknown)", reviewer_lab or "(unknown)",
+        orchestrator_lab or "(unknown)",
+        reviewer_lab or "(unknown)",
     )
 
     # Determine initial fail-closed reason before seam registration.
@@ -166,7 +167,8 @@ def register_gate(ctx, *, raw_config: dict | None = None) -> None:
 
     audit = AuditStore(cfg.audit_path)
     adapter = ReviewGateAdapter(
-        cfg, audit,
+        cfg,
+        audit,
         fail_closed_override=fail_closed_override,
         fail_closed_reason=fail_closed_reason,
     )

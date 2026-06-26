@@ -32,9 +32,14 @@ DELEGATE_TOOL = "delegate_task"
 class ReviewGateAdapter:
     """Hermes plugin wiring: tool_request middleware (tighten) + pre_tool_call hook (block)."""
 
-    def __init__(self, gate_config: ReviewGateConfig, audit_store: AuditStore,
-                 *, fail_closed_override: bool = False,
-                 fail_closed_reason: str = "") -> None:
+    def __init__(
+        self,
+        gate_config: ReviewGateConfig,
+        audit_store: AuditStore,
+        *,
+        fail_closed_override: bool = False,
+        fail_closed_reason: str = "",
+    ) -> None:
         self._cfg = gate_config
         self._audit = audit_store
         self._memo: dict[str, Verdict] = {}  # tool_call_id -> verdict
@@ -130,8 +135,9 @@ class ReviewGateAdapter:
         """Run the actual review for a (possibly batched) delegate_task call."""
         # Cross-lab fail-closed override: block everything.
         if self._fail_closed_override:
-            verdict = Verdict(decision="block", added_constraints=[],
-                              reason=self._fail_closed_reason)
+            verdict = Verdict(
+                decision="block", added_constraints=[], reason=self._fail_closed_reason
+            )
             self._record(tool_call_id, tool_name, args, "n/a", verdict)
             return verdict
 
@@ -175,11 +181,13 @@ class ReviewGateAdapter:
                 all_constraints.extend(v.added_constraints)
 
         if block_reasons:
-            return Verdict(decision="block", added_constraints=[],
-                           reason="; ".join(block_reasons))
+            return Verdict(decision="block", added_constraints=[], reason="; ".join(block_reasons))
         if saw_tighten:
-            return Verdict(decision="tighten", added_constraints=all_constraints,
-                           reason="reviewer added constraints (batch)")
+            return Verdict(
+                decision="tighten",
+                added_constraints=all_constraints,
+                reason="reviewer added constraints (batch)",
+            )
         return Verdict(decision="allow", added_constraints=[], reason="")
 
     # ── helpers ─────────────────────────────────────────────────────────────
@@ -192,8 +200,9 @@ class ReviewGateAdapter:
         tightened["gate_constraints"] = existing + list(constraints)
         return tightened
 
-    def _record(self, tool_call_id, tool_name: str, args: dict,
-                blast: str, verdict: Verdict) -> None:
+    def _record(
+        self, tool_call_id, tool_name: str, args: dict, blast: str, verdict: Verdict
+    ) -> None:
         try:
             self._audit.record(
                 tool_call_id=str(tool_call_id or ""),
