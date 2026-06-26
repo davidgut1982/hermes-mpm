@@ -209,7 +209,7 @@ RECOVER_SCHEMA: Dict[str, Any] = {
 # Tool handlers
 # ---------------------------------------------------------------------------
 
-def handle_init(args: Dict[str, Any]) -> str:
+def handle_init(args: Dict[str, Any], **_ctx: Any) -> str:
     """Initialize a pipeline run."""
     task_id = args["task_id"]
     description = args.get("description", "")
@@ -245,7 +245,7 @@ def handle_init(args: Dict[str, Any]) -> str:
     })
 
 
-def handle_transition(args: Dict[str, Any]) -> str:
+def handle_transition(args: Dict[str, Any], **_ctx: Any) -> str:
     """Transition to the next phase."""
     task_id = args["task_id"]
     target = args["phase"]
@@ -291,7 +291,7 @@ def handle_transition(args: Dict[str, Any]) -> str:
     })
 
 
-def handle_record_evidence(args: Dict[str, Any]) -> str:
+def handle_record_evidence(args: Dict[str, Any], **_ctx: Any) -> str:
     """Record evidence at a gate."""
     task_id = args["task_id"]
     phase = args["phase"]
@@ -333,7 +333,7 @@ def handle_record_evidence(args: Dict[str, Any]) -> str:
     })
 
 
-def handle_verify_gate(args: Dict[str, Any]) -> str:
+def handle_verify_gate(args: Dict[str, Any], **_ctx: Any) -> str:
     """Verify that a phase gate has passed."""
     task_id = args["task_id"]
     phase = args["phase"]
@@ -382,7 +382,7 @@ def handle_verify_gate(args: Dict[str, Any]) -> str:
         })
 
 
-def handle_status(args: Dict[str, Any]) -> str:
+def handle_status(args: Dict[str, Any], **_ctx: Any) -> str:
     """Show pipeline status."""
     task_id = args.get("task_id", "")
 
@@ -418,7 +418,7 @@ def handle_status(args: Dict[str, Any]) -> str:
             return json.dumps({"success": True, "pipelines": summary, "count": len(summary)})
 
 
-def handle_recover(args: Dict[str, Any]) -> str:
+def handle_recover(args: Dict[str, Any], **_ctx: Any) -> str:
     """Handle a pipeline failure."""
     task_id = args["task_id"]
     strategy = args["strategy"]
