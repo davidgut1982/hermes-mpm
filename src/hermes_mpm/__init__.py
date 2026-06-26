@@ -102,24 +102,25 @@ def _make_pre_llm_call(cfg: dict):
 # Kept as a module constant so tests can read it without instantiating the hook.
 # Length target: <200 tokens. Do NOT add examples here — the SKILL.md has them.
 _DECOMPOSE_HINT: str = (
-    "[MPM] YOUR FIRST ACTION on every user turn: count separable subtasks. "
-    "A subtask is any distinct item, numbered point, named topic, or research angle "
-    "that can run independently. "
-    "COUNT ≥ 2 → call hermes_mpm_orchestrate NOW with all subtasks batched. "
-    "Do NOT answer inline. Do NOT use tools yourself. Orchestrate first, always. "
-    "Examples that MUST orchestrate: "
-    "  '(1) latest AI news (2) KB on MCP (3) arxiv papers (4) Anthropic headlines' → 4 subtasks; "
-    "  'find bugs: TODOs, error handling, deprecated code, perf, security' → 5 subtasks; "
-    "  'research X and look up Y' → 2 subtasks. "
+    "[MPM] When a turn needs several INDEPENDENT lookups or reads, issue them as "
+    "PARALLEL tool calls in ONE turn — multiple gh-axi/file-read/tavily-axi/lore-axi "
+    "calls together, not one per turn and not chained with &&. Two patterns: "
+    "(A) SAME-kind independent lookups (e.g. 'summarize issues 101, 202, 303', "
+    "'read these 4 files', 'search news on X, Y, Z') → emit the calls in parallel "
+    "yourself; do NOT orchestrate. "
+    "(B) Independent subtasks that each need a DIFFERENT specialist profile → call "
+    "hermes_mpm_orchestrate ONCE with all subtasks batched (parallel fan-out). "
+    "MUST orchestrate (multi-specialist): "
+    "  '(1) latest AI news (2) KB on MCP (3) arxiv papers' → search+kb+search profiles; "
+    "  'research X and look up our KB on Y' → search+kb. "
     "Profile routing: web/news/current/arxiv → profile='search'; "
     "kb/notes/knowledge → profile='kb'; ops/service/cluster → profile='ops'; "
     "code/engineering → profile='engineer'. "
-    "For search subtasks, context MUST include: "
-    "'FIRST ACTION: run in terminal NOW: tavily-axi search \"<query>\" --include-answer\\n"
-    "No KB. No MCP. Execute immediately.' "
-    "COUNT = 1 → handle directly (single topic = no fan-out). "
-    "Examples that must NOT orchestrate: 'what is the weather', 'summarize file X', "
-    "'what does our KB say about Y' (one topic). "
+    "Search subtasks resolve their query by running tavily-axi search directly "
+    "(no KB, no MCP); put that in the subtask's context so the spawned search agent "
+    "fetches the web result, not training data. "
+    "Single topic, or a message that refers to prior context ('do it', 'go ahead', "
+    "'lore it') → handle inline; don't invent subtasks or fan out. "
     "Max 5 concurrent subtasks; batch if more."
 )
 
@@ -174,6 +175,14 @@ def _make_decompose_hint_hook():
         platform = (kw.get("platform") or "").lower()
         # Suppress on subagent turns — children should not receive PM instructions.
         if platform in ("subagent", "leaf"):
+            return None
+        # Suppress on short / referential messages. These are almost always a
+        # single action tied to prior conversation context ("lore it", "do it",
+        # "yes", "go ahead", "continue"), NOT a multi-part request. Injecting
+        # fan-out pressure here causes the model to invent subtasks the user
+        # never asked for — a direct hallucination trigger.
+        msg = (kw.get("user_message") or "")
+        if len(msg.strip().split()) <= 6:
             return None
         # Capture the live agent so orchestrator.handle() can inject it as
         # parent_agent when dispatching delegate_task. The plugin tool dispatch
