@@ -174,27 +174,43 @@ def _make_decompose_hint_hook():
     def hint_hook(**kw) -> dict | None:
         platform = (kw.get("platform") or "").lower()
         # Suppress on subagent turns — children should not receive PM instructions.
+        # Clear any captured agent so a child turn cannot read a stale parent agent.
         if platform in ("subagent", "leaf"):
+            try:
+                orchestrator.clear_agent()
+            except Exception:
+                pass
             return None
         # Suppress on short / referential messages. These are almost always a
         # single action tied to prior conversation context ("lore it", "do it",
         # "yes", "go ahead", "continue"), NOT a multi-part request. Injecting
         # fan-out pressure here causes the model to invent subtasks the user
         # never asked for — a direct hallucination trigger.
+        #
+        # Finding 3(a): clear the captured agent on these short turns too — the
+        # capture below is skipped here, so without an explicit clear a short
+        # referential turn would inherit a STALE agent captured by a prior turn.
         msg = (kw.get("user_message") or "")
         if len(msg.strip().split()) <= 6:
-            return None
-        # Capture the live agent so orchestrator.handle() can inject it as
-        # parent_agent when dispatching delegate_task. The plugin tool dispatch
-        # path does not pass parent_agent; this pre_llm_call hook fires before
-        # every LLM response (and therefore before any tool call in the turn),
-        # so _captured_agent is always fresh when hermes_mpm_orchestrate runs.
-        _agent = kw.get("agent")
-        if _agent is not None:
             try:
-                orchestrator.capture_agent(_agent)
+                orchestrator.clear_agent()
             except Exception:
-                pass  # never break the turn
+                pass
+            return None
+        # Capture the live agent (per-context contextvar) so orchestrator.handle()
+        # can inject it as parent_agent when dispatching delegate_task. The plugin
+        # tool dispatch path does not pass parent_agent; this pre_llm_call hook
+        # fires before every LLM response (and therefore before any tool call in
+        # the turn), so the captured agent is fresh when hermes_mpm_orchestrate
+        # runs. If no agent is provided, clear so a prior turn's agent can't leak.
+        _agent = kw.get("agent")
+        try:
+            if _agent is not None:
+                orchestrator.capture_agent(_agent)
+            else:
+                orchestrator.clear_agent()
+        except Exception:
+            pass  # never break the turn
         return {"context": _DECOMPOSE_HINT}
 
     hint_hook.__name__ = "hermes_mpm_decompose_hint"
