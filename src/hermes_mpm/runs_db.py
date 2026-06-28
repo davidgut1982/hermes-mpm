@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import sqlite3
 import time
@@ -72,7 +73,8 @@ CREATE TABLE IF NOT EXISTS subagent_runs (
     error             TEXT,
     delegation_id     TEXT,
     run_type          TEXT,
-    metadata          TEXT
+    metadata          TEXT,
+    owner_pid         INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_runs_status  ON subagent_runs(status);
 CREATE INDEX IF NOT EXISTS idx_runs_parent  ON subagent_runs(parent_session_id);
@@ -191,15 +193,37 @@ def init_db() -> None:
 
     Why: DDL must run exactly at startup, never on a hot write path — concurrent
     CREATE/ALTER is what historically corrupted the kanban DB. Centralizing it
-    here keeps record_start/record_end DDL-free.
-    What: Opens a connection and executescript()s the IF NOT EXISTS schema.
-    Test: ``test_init_db_is_idempotent`` calls it twice with data present.
+    here keeps record_start/record_end DDL-free. The ``owner_pid`` ALTER migrates
+    DBs created before process-ownership existed so the orphan sweep can scope to
+    its own runs (the data-corruption fix).
+    What: Opens a connection, executescript()s the IF NOT EXISTS schema (fresh DBs
+    get owner_pid in CREATE), then ALTER-adds owner_pid if an EXISTING table lacks
+    it — guarded by a PRAGMA column check so re-runs are a clean no-op.
+    Test: ``test_init_db_is_idempotent`` + ``test_init_db_adds_owner_pid_to_existing_db``.
     """
     conn = _connect()
     try:
         conn.executescript(_SCHEMA_SQL)
+        _ensure_owner_pid_column(conn)
     finally:
         conn.close()
+
+
+def _ensure_owner_pid_column(conn: sqlite3.Connection) -> None:
+    """Idempotently add the owner_pid column to an existing subagent_runs table.
+
+    Why: A DB created before the process-ownership fix has no owner_pid column;
+    the orphan sweep needs it to distinguish its own in-flight runs from a dead
+    process's. CREATE TABLE IF NOT EXISTS won't add a column to an existing table,
+    so we migrate with an explicit guarded ALTER.
+    What: Reads PRAGMA table_info; if owner_pid is absent, ALTER TABLE ADD COLUMN
+    owner_pid INTEGER. No-op when the column already exists (fresh CREATE path or
+    a prior migration). Runs only inside init_db (never on a hot write path).
+    Test: ``test_init_db_adds_owner_pid_to_existing_db`` (legacy DB + double init).
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(subagent_runs)")}
+    if "owner_pid" not in cols:
+        conn.execute("ALTER TABLE subagent_runs ADD COLUMN owner_pid INTEGER")
 
 
 def record_start(
@@ -217,18 +241,22 @@ def record_start(
 
     Why: The subagent_start hook may fire more than once for a logically-single
     run (retries, re-entry); OR IGNORE keeps the original start authoritative and
-    makes the hook safe to call repeatedly.
-    What: Inserts one ``running`` row keyed by run_id (= child_session_id).
+    makes the hook safe to call repeatedly. ``owner_pid`` is stamped here so the
+    orphan sweep can reap only PRIOR-process runs, never the current process's own
+    in-flight rows (the data-corruption fix).
+    What: Inserts one ``running`` row keyed by run_id (= child_session_id),
+    stamped with owner_pid = os.getpid().
     Test: ``test_record_start_creates_running_row`` +
-    ``test_record_start_insert_or_ignore_is_idempotent``.
+    ``test_record_start_insert_or_ignore_is_idempotent`` +
+    ``test_record_start_stamps_owner_pid``.
     """
     meta_json = json.dumps(metadata) if metadata else None
     _write(
         """
         INSERT OR IGNORE INTO subagent_runs (
             run_id, parent_session_id, role, profile, goal, status,
-            started_at, delegation_id, run_type, metadata
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            started_at, delegation_id, run_type, metadata, owner_pid
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_id,
@@ -241,6 +269,7 @@ def record_start(
             delegation_id,
             run_type,
             meta_json,
+            os.getpid(),
         ),
     )
 
@@ -272,24 +301,80 @@ def record_end(
     )
 
 
-def sweep_orphaned(now: int) -> int:
-    """Mark every still-``running`` row as ``crashed`` (restart durability fill).
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness check for a pid via os.kill(pid, 0).
+
+    Why: A defensive guard against the rare same-pid edge case (a recycled pid).
+    If a row's owner pid is still alive, the owner is genuinely running and its
+    run must NOT be reaped — even if it isn't the current process.
+    What: Returns True if os.kill(pid, 0) does not raise ProcessLookupError; a
+    PermissionError means the pid exists but is owned by another user → alive.
+    Any other OSError → treat as not-alive (fail toward reaping a stuck row).
+    Test: Exercised indirectly via the ownership sweep tests; os.kill(getpid(),0)
+    confirms our own process is reported alive.
+    """
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def sweep_orphaned(now: int, current_pid: Optional[int] = None) -> int:
+    """Mark PRIOR-process ``running`` rows ``crashed`` (restart durability fill).
 
     Why: A process that dies mid-run can never fire subagent_stop, so its run
-    would linger ``running`` forever. Sweeping at startup converts those into a
-    truthful ``crashed`` state so observability isn't permanently wrong.
-    What: UPDATEs rows with status='running' AND ended_at IS NULL to
-    status='crashed', error='orphaned by restart', ended_at=now. Returns count.
-    Test: ``test_sweep_orphaned_marks_running_crashed``.
+    would linger ``running`` forever. The original sweep reaped EVERY running row,
+    which corrupted data: any process loading the plugin (the CLI, the dashboard)
+    swept the live gateway's in-flight runs to ``crashed`` and made async runs
+    permanently un-closable. The fix scopes the sweep to runs the CURRENT process
+    does NOT own — a freshly-started gateway owns no prior runs, so this reaps the
+    dead process's runs while never touching anything the current process created.
+    What: UPDATEs running rows whose owner_pid IS NULL (legacy/pre-migration) OR
+    differs from current_pid (default os.getpid()) AND whose owner is not still
+    alive (best-effort os.kill check), setting status='crashed',
+    error='orphaned by restart', ended_at=now. Returns the count reaped.
+    Test: ``test_sweep_orphaned_marks_running_crashed`` +
+    ``test_sweep_orphaned_only_reaps_other_pid_rows``.
     """
-    return _write(
-        """
-        UPDATE subagent_runs
-           SET status = ?, error = ?, ended_at = ?
-         WHERE status = ? AND ended_at IS NULL
-        """,
-        (STATUS_CRASHED, _ORPHAN_ERROR, int(now), STATUS_RUNNING),
-    )
+    if current_pid is None:
+        current_pid = os.getpid()
+
+    conn = _connect()
+    try:
+        candidates = conn.execute(
+            """
+            SELECT run_id, owner_pid FROM subagent_runs
+             WHERE status = ? AND ended_at IS NULL
+               AND (owner_pid IS NULL OR owner_pid != ?)
+            """,
+            (STATUS_RUNNING, current_pid),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # Defensive: never reap a row whose (other) owner pid is still alive — that
+    # owner is genuinely running; only NULL-owner or dead-owner rows are orphans.
+    reap_ids = [
+        r["run_id"]
+        for r in candidates
+        if r["owner_pid"] is None or not _pid_alive(int(r["owner_pid"]))
+    ]
+    count = 0
+    for run_id in reap_ids:
+        count += _write(
+            """
+            UPDATE subagent_runs
+               SET status = ?, error = ?, ended_at = ?
+             WHERE run_id = ? AND status = ? AND ended_at IS NULL
+            """,
+            (STATUS_CRASHED, _ORPHAN_ERROR, int(now), run_id, STATUS_RUNNING),
+        )
+    return count
 
 
 def query_runs(

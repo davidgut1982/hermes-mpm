@@ -12,6 +12,7 @@ Test: ``pytest src/hermes_mpm/tests/test_runs_hooks.py``.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 
 import pytest
@@ -177,3 +178,129 @@ def test_register_wires_subagent_hooks(monkeypatch, tmp_path):
     hermes_mpm.register(ctx)
     assert "subagent_start" in ctx.hooks
     assert "subagent_stop" in ctx.hooks
+
+
+class _FakeCtx:
+    """Minimal ctx recording only the hooks it was given (register smoke tests)."""
+
+    def __init__(self):
+        self.hooks = []
+
+    def register_cli_command(self, **k):
+        pass
+
+    def register_command(self, **k):
+        pass
+
+    def register_hook(self, hook_name, callback):
+        self.hooks.append(hook_name)
+
+    def register_tool(self, **k):
+        pass
+
+    def register_skill(self, **k):
+        pass
+
+
+def test_subagent_start_handler_stamps_owner_pid(db):
+    """The start hook must persist owner_pid = this process's pid so the gateway
+    sweep can distinguish its own in-flight runs from a dead process's."""
+    handler = hermes_mpm._make_subagent_start_handler()
+    handler(parent_session_id="p1", child_session_id="c1", child_goal="g")
+    assert _rows(db)["c1"]["owner_pid"] == os.getpid()
+
+
+def test_register_does_not_sweep_when_not_gateway(db, monkeypatch):
+    """A non-gateway process (no _HERMES_GATEWAY=1) must NOT sweep — running rows
+    survive. This is the core data-corruption fix: `hermes mpm runs` and the
+    dashboard load the plugin too, and must never mark the gateway's live runs
+    crashed."""
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    # A live run owned by some other (gateway) process.
+    runs_db._write(
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) "
+        "VALUES (?, ?, ?, ?)",
+        ("live", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
+    )
+
+    hermes_mpm.register(_FakeCtx())
+
+    # The CLI/dashboard load must have left the live run alone.
+    assert _rows(db)["live"]["status"] == "running"
+
+
+def test_register_sweeps_when_gateway(db, monkeypatch):
+    """Inside the gateway process (_HERMES_GATEWAY=1) the sweep DOES run, reaping
+    prior-process running rows while leaving this process's own rows alone."""
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    # Prior dead process's run — should be reaped.
+    runs_db._write(
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) "
+        "VALUES (?, ?, ?, ?)",
+        ("prior", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
+    )
+    # This process's own run — should survive (current pid).
+    runs_db._write(
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) "
+        "VALUES (?, ?, ?, ?)",
+        ("mine", runs_db.STATUS_RUNNING, 1, os.getpid()),
+    )
+
+    hermes_mpm.register(_FakeCtx())
+
+    rows = _rows(db)
+    assert rows["prior"]["status"] == "crashed"
+    assert rows["mine"]["status"] == "running"
+
+
+def test_async_complete_handler_parses_duration(db):
+    """The async-complete marker carries a `Duration: Ns` line; the handler must
+    parse it and pass duration_ms to record_end so async runs show a duration
+    like sync runs do."""
+    start = hermes_mpm._make_subagent_start_handler()
+    start(child_session_id="c-async", parent_session_id="p1", child_goal="nightly report")
+
+    marker = (
+        "[ASYNC DELEGATION COMPLETE — deleg_abc12345]\n"
+        "Original goal: nightly report\n"
+        "Status: completed   API calls: 3   Duration: 5s\n"
+        "--- RESULT ---\n"
+        "done\n"
+    )
+    hermes_mpm._make_async_complete_handler()(user_message=marker)
+
+    r = _rows(db)["c-async"]
+    assert r["status"] == "done"
+    assert r["duration_ms"] == 5000
+
+
+def test_async_run_end_to_end_not_swept_then_closed(db, monkeypatch):
+    """Full async lifecycle: started (running) → a CLI/non-gateway register()
+    runs (must NOT sweep it) → closed by the async-complete marker (done).
+
+    This is the end-to-end proof of the data-corruption fix: an in-flight async
+    run survives an interleaved `hermes mpm runs` load and is still closable."""
+    # 1) Async child starts → running row, owner_pid stamped.
+    start = hermes_mpm._make_subagent_start_handler()
+    start(child_session_id="c-async", parent_session_id="p1", child_goal="long async job")
+    assert _rows(db)["c-async"]["status"] == "running"
+
+    # 2) A non-gateway process (the CLI) loads the plugin — must NOT sweep.
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    hermes_mpm.register(_FakeCtx())
+    assert _rows(db)["c-async"]["status"] == "running"  # still alive — not crashed
+
+    # 3) The async-complete marker re-enters and closes the run.
+    marker = (
+        "[ASYNC DELEGATION COMPLETE — deleg_ffff0001]\n"
+        "Original goal: long async job\n"
+        "Status: completed   API calls: 1   Duration: 7s\n"
+        "--- RESULT ---\n"
+        "ok\n"
+    )
+    hermes_mpm._make_async_complete_handler()(user_message=marker)
+
+    r = _rows(db)["c-async"]
+    assert r["status"] == "done"
+    assert r["duration_ms"] == 7000
+    assert r["ended_at"] is not None

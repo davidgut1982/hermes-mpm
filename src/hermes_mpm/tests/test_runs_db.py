@@ -12,6 +12,7 @@ Test: Run ``pytest src/hermes_mpm/tests/test_runs_db.py`` — all must pass.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 
@@ -96,17 +97,22 @@ def test_record_end_records_error(db):
     assert r["error"] == "boom"
 
 
-def test_sweep_orphaned_marks_running_crashed(db):
+def test_sweep_orphaned_marks_running_crashed(db, monkeypatch):
+    # Rows "a"/"b" are stamped with THIS process's pid by record_start. To
+    # exercise the "prior dead process" path the sweep must run with a DIFFERENT
+    # current_pid than the one that owns the rows, and that owner must be dead.
+    monkeypatch.setattr(runs_db, "_pid_alive", lambda pid: False)
     runs_db.record_start("a", "p", "r", None, "g", 1, "subagent")
     runs_db.record_start("b", "p", "r", None, "g", 1, "subagent")
     runs_db.record_end("b", status="done", ended_at=2)
-    n = runs_db.sweep_orphaned(now=500)
+    other_pid = os.getpid() + 1
+    n = runs_db.sweep_orphaned(now=500, current_pid=other_pid)
     assert n == 1
     rows = {r["run_id"]: r for r in _rows(db)}
     assert rows["a"]["status"] == "crashed"
     assert rows["a"]["error"] == "orphaned by restart"
     assert rows["a"]["ended_at"] == 500
-    assert rows["b"]["status"] == "done"  # untouched
+    assert rows["b"]["status"] == "done"  # untouched (already ended)
 
 
 def test_query_runs_filters_and_orders(db):
@@ -188,3 +194,115 @@ def test_concurrent_start_end_no_corruption(db):
     rows = _rows(db)
     assert len(rows) == n_threads * per_thread
     assert all(r["status"] == "done" for r in rows)
+
+
+def test_record_start_stamps_owner_pid(db):
+    """record_start must stamp owner_pid = os.getpid() so the sweep can tell its
+    own in-flight rows from a prior dead process's rows."""
+    runs_db.record_start("c", "p", "r", None, "g", 1000, "subagent")
+    r = _rows(db)[0]
+    assert r["owner_pid"] == os.getpid()
+
+
+def test_sweep_orphaned_only_reaps_other_pid_rows(db, monkeypatch):
+    """A gateway sweep with a fresh current_pid marks PRIOR-pid running rows
+    crashed but leaves rows owned by current_pid untouched.
+
+    A freshly-started gateway owns no prior runs, so pid-scoping reaps the
+    dead process's runs while never touching anything the current process will
+    create."""
+    # The prior owner pid is treated as dead so liveness can't mask the scoping.
+    monkeypatch.setattr(runs_db, "_pid_alive", lambda pid: False)
+    current_pid = os.getpid()
+    prior_pid = current_pid + 1  # a different (dead) process
+
+    # Row owned by a prior (dead) process — must be reaped.
+    runs_db._write(
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) "
+        "VALUES (?, ?, ?, ?)",
+        ("prior", runs_db.STATUS_RUNNING, 1, prior_pid),
+    )
+    # Row with NULL owner_pid (legacy / pre-migration) — must be reaped.
+    runs_db._write(
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) "
+        "VALUES (?, ?, ?, ?)",
+        ("legacy", runs_db.STATUS_RUNNING, 1, None),
+    )
+    # Row owned by the CURRENT process — must be left untouched.
+    runs_db._write(
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) "
+        "VALUES (?, ?, ?, ?)",
+        ("mine", runs_db.STATUS_RUNNING, 1, current_pid),
+    )
+
+    n = runs_db.sweep_orphaned(now=500, current_pid=current_pid)
+    assert n == 2
+    rows = {r["run_id"]: r for r in _rows(db)}
+    assert rows["prior"]["status"] == "crashed"
+    assert rows["prior"]["error"] == "orphaned by restart"
+    assert rows["prior"]["ended_at"] == 500
+    assert rows["legacy"]["status"] == "crashed"
+    assert rows["mine"]["status"] == "running"  # current pid — left alone
+    assert rows["mine"]["ended_at"] is None
+
+
+def test_sweep_orphaned_skips_alive_other_owner(db, monkeypatch):
+    """Defensive hardening: a running row owned by a DIFFERENT but still-ALIVE
+    process must NOT be reaped (that owner is genuinely running)."""
+    monkeypatch.setattr(runs_db, "_pid_alive", lambda pid: True)
+    other_pid = os.getpid() + 1
+    runs_db._write(
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) "
+        "VALUES (?, ?, ?, ?)",
+        ("alive_other", runs_db.STATUS_RUNNING, 1, other_pid),
+    )
+    n = runs_db.sweep_orphaned(now=500, current_pid=os.getpid())
+    assert n == 0
+    assert _rows(db)[0]["status"] == "running"
+
+
+def test_init_db_adds_owner_pid_to_existing_db(tmp_path, monkeypatch):
+    """init_db must be idempotent on an EXISTING db that lacks owner_pid: the
+    ALTER adds the column without error, and re-running init_db is a no-op."""
+    path = tmp_path / "mpm_runs.db"
+    monkeypatch.setattr(runs_db, "_db_path", lambda: path)
+
+    # Build a legacy DB by hand with the ORIGINAL schema (all columns) but
+    # WITHOUT owner_pid — exactly what a pre-fix DB on disk looks like.
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE subagent_runs ("
+            "run_id TEXT PRIMARY KEY, parent_session_id TEXT, role TEXT, profile TEXT, "
+            "goal TEXT, status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, "
+            "duration_ms INTEGER, summary TEXT, error TEXT, delegation_id TEXT, "
+            "run_type TEXT, metadata TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO subagent_runs (run_id, status, started_at) VALUES (?, ?, ?)",
+            ("legacy", runs_db.STATUS_RUNNING, 1),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # First init_db must ALTER-add owner_pid without raising.
+    runs_db.init_db()
+    cols = {r["name"] for r in _pragma_cols(path)}
+    assert "owner_pid" in cols
+    # Existing legacy row preserved; its owner_pid defaults to NULL.
+    rows = {r["run_id"]: r for r in _rows(path)}
+    assert rows["legacy"]["owner_pid"] is None
+
+    # Second init_db on the now-migrated DB is a clean no-op (idempotent ALTER).
+    runs_db.init_db()
+    assert "owner_pid" in {r["name"] for r in _pragma_cols(path)}
+
+
+def _pragma_cols(path):
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.row_factory = sqlite3.Row
+        return [dict(r) for r in conn.execute("PRAGMA table_info(subagent_runs)")]
+    finally:
+        conn.close()

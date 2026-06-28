@@ -15,6 +15,7 @@ registers a CLI command "mpm", a "pre_llm_call" hook, the
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -56,6 +57,29 @@ _ASYNC_MARKER_PREFIX = "[ASYNC DELEGATION COMPLETE — deleg_"
 _RE_DELEG_ID = re.compile(r"\[ASYNC DELEGATION COMPLETE — (deleg_[0-9a-f]+)\]")
 _RE_ASYNC_STATUS = re.compile(r"^Status:\s*(\S+)", re.MULTILINE)
 _RE_ASYNC_GOAL = re.compile(r"^Original goal:\s*(.+)$", re.MULTILINE)
+# Duration appears inline on the Status line, e.g. "… Duration: 12s". Captured so
+# async runs record a duration like sync runs do (which get duration_ms from the
+# subagent_stop hook). Bare seconds only — the marker never emits sub-second.
+_RE_ASYNC_DURATION = re.compile(r"Duration:\s*(\d+)\s*s", re.IGNORECASE)
+
+
+def _parse_async_duration_ms(msg: str) -> int | None:
+    """Parse the ``Duration: Ns`` field from an async-complete marker → ms.
+
+    Why: Async runs are closed by the pre_llm_call fallback (not subagent_stop),
+    so without parsing the marker they'd show no duration while sync runs do. This
+    surfaces the wall-clock the engine already printed in the marker.
+    What: Returns the integer seconds from ``Duration: <N>s`` × 1000, or None when
+    the field is absent/malformed (record_end then leaves duration_ms NULL).
+    Test: ``test_async_complete_handler_parses_duration`` (5s → 5000).
+    """
+    m = _RE_ASYNC_DURATION.search(msg or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1)) * 1000
+    except (TypeError, ValueError):
+        return None
 
 
 def _map_child_status(child_status) -> str:
@@ -177,6 +201,7 @@ def _make_async_complete_handler():
                 run_id=run_id,
                 status=status,
                 ended_at=int(time.time()),
+                duration_ms=_parse_async_duration_ms(msg),
             )
             # Stamp the delegation_id onto the row for cross-ref if it wasn't set
             # at start (the common case — start has no delegation_id).
@@ -454,21 +479,36 @@ def register(ctx) -> None:
     except Exception as exc:
         logger.debug("hermes-mpm: ctx capture for orchestrator skipped: %s", exc)
 
-    # 0) Run-tracking DB — startup lifecycle: init schema, sweep restart-orphaned
-    #    runs (the durability fill), then purge old ended rows. DDL runs ONLY
-    #    here (init_db), never on a hot hook path. All best-effort: a tracking-DB
-    #    failure must degrade the hooks to no-ops, never block plugin load.
+    # 0) Run-tracking DB — startup lifecycle: init schema, then (GATEWAY ONLY)
+    #    sweep restart-orphaned runs + purge old ended rows. DDL runs ONLY here
+    #    (init_db), never on a hot hook path.
+    #
+    #    CRITICAL: register() runs in EVERY process that loads the plugin — the
+    #    gateway, but ALSO `hermes mpm runs` and the dashboard. The sweep/purge
+    #    are MUTATING; running them outside the gateway corrupted data (the CLI or
+    #    dashboard would mark the live gateway's in-flight runs ``crashed`` and
+    #    make async runs permanently un-closable). So we gate them behind
+    #    _HERMES_GATEWAY=1 — the env the gateway process sets (gateway/run.py) and
+    #    explicitly strips from its watcher/children. init_db (idempotent, additive
+    #    ALTER) is safe everywhere and still runs so the CLI sees current schema.
+    #    All best-effort: a tracking-DB failure must degrade hooks to no-ops, never
+    #    block plugin load.
     try:
         runs_db.init_db()
-        now = int(time.time())
-        orphaned = runs_db.sweep_orphaned(now)
-        retention_days = _runs_retention_days(cfg)
-        purged = runs_db.purge_old(retention_days, now)
-        logger.info(
-            "mpm-runs: db ready, %d orphaned run(s) marked crashed, %d old run(s) purged",
-            orphaned,
-            purged,
-        )
+        if os.environ.get("_HERMES_GATEWAY") == "1":
+            now = int(time.time())
+            orphaned = runs_db.sweep_orphaned(now, os.getpid())
+            retention_days = _runs_retention_days(cfg)
+            purged = runs_db.purge_old(retention_days, now)
+            logger.info(
+                "mpm-runs: db ready, %d orphaned run(s) marked crashed, %d old run(s) purged",
+                orphaned,
+                purged,
+            )
+        else:
+            logger.debug(
+                "mpm-runs: db ready (non-gateway process — sweep/purge skipped)"
+            )
     except Exception as exc:
         logger.warning("hermes-mpm: run-tracking DB init skipped: %s", exc)
 
