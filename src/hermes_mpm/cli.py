@@ -14,6 +14,7 @@ config summary and returns 0 (OK/DISABLED) or non-zero (WARN/misconfigured).
 from __future__ import annotations
 
 import argparse
+import time
 
 from . import profiles, routing
 
@@ -58,6 +59,32 @@ def setup(parser: argparse.ArgumentParser) -> None:
         ),
     )
 
+    runs_p = sub.add_parser(
+        "runs",
+        help="List tracked subagent runs (no LLM): status, age, duration, goal.",
+    )
+    runs_p.add_argument(
+        "--status",
+        default=None,
+        help="Filter by status: running|done|failed|crashed|timed_out.",
+    )
+    runs_p.add_argument(
+        "--session",
+        default=None,
+        help="Filter by parent session id.",
+    )
+    runs_p.add_argument(
+        "--since",
+        default=None,
+        help="Only runs started within this window, e.g. 1h, 24h, 7d.",
+    )
+    runs_p.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Max rows to show (newest first). Default: 50.",
+    )
+
     # Default action when `hermes mpm` is called bare.
     parser.set_defaults(mpm_action=None)
 
@@ -78,9 +105,100 @@ def handle(args: argparse.Namespace) -> int:
         return _routing(args)
     if action == "gate-status":
         return _gate_status_from_live_config()
+    if action == "runs":
+        return _runs(args)
 
     print(f"Unknown mpm action: {action!r}")
     return 2
+
+
+def _parse_since(since: str | None) -> int | None:
+    """Convert a ``1h``/``24h``/``7d``/``30m`` window into an epoch cutoff.
+
+    Why: Operators think in relative windows ("runs in the last 24h"), not epoch
+    seconds; this maps the shorthand to ``now - delta`` for query_runs(since=).
+    What: Parses ``<int><s|m|h|d>`` (or a bare int = seconds) and returns the
+    epoch cutoff, or None when ``since`` is empty/unparseable (no filter).
+    Test: ``test_runs_since_filter_parses_duration`` exercises 24h and 7d.
+    """
+    if not since:
+        return None
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    raw = since.strip().lower()
+    try:
+        if raw[-1] in units:
+            delta = int(raw[:-1]) * units[raw[-1]]
+        else:
+            delta = int(raw)
+    except (ValueError, IndexError):
+        return None
+    return int(time.time()) - delta
+
+
+def _fmt_age(seconds: float) -> str:
+    """Render a compact age like ``5s``/``3m``/``2h``/``4d``.
+
+    Why: A fixed-width relative age reads faster than absolute timestamps in a
+    terminal table.
+    What: Returns the largest single unit <= the duration.
+    Test: Implicitly via ``test_runs_formats_rows`` (output is non-empty).
+    """
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def _runs(args: argparse.Namespace) -> int:
+    """Print tracked subagent runs as a compact table (no LLM).
+
+    Why: The operator-facing read surface over the run DB — answers "what ran /
+    is running / crashed" across restarts without touching the gateway.
+    What: Queries runs_db.query_runs with the parsed filters and prints a fixed
+    -width table (short run id, status, profile/role, age, duration, goal). Prints
+    a clean notice and returns 0 when there are no matching runs.
+    Test: ``test_runs_empty`` + ``test_runs_formats_rows`` + ``test_runs_status_filter``.
+    """
+    from . import runs_db
+
+    status = getattr(args, "status", None)
+    session = getattr(args, "session", None)
+    since = _parse_since(getattr(args, "since", None))
+    limit = getattr(args, "limit", 50) or 50
+
+    try:
+        rows = runs_db.query_runs(status=status, session=session, since=since, limit=limit)
+    except Exception as exc:  # DB unreadable — report, don't crash the CLI
+        print(f"runs: could not read run DB: {exc}")
+        return 1
+
+    if not rows:
+        print("No runs match.")
+        return 0
+
+    now = time.time()
+    header = f"{'RUN':<10} {'STATUS':<9} {'PROFILE':<12} {'AGE':>5} {'DUR':>7}  GOAL"
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        run_id = (r.get("run_id") or "")[:8]
+        rstatus = r.get("status") or "?"
+        profile = (r.get("profile") or r.get("role") or "-")[:12]
+        started = r.get("started_at") or now
+        age = _fmt_age(now - started)
+        dur_ms = r.get("duration_ms")
+        dur = f"{dur_ms / 1000:.1f}s" if isinstance(dur_ms, (int, float)) else "-"
+        goal = (r.get("goal") or "").replace("\n", " ")
+        if len(goal) > 48:
+            goal = goal[:47] + "…"
+        print(f"{run_id:<10} {rstatus:<9} {profile:<12} {age:>5} {dur:>7}  {goal}")
+
+    print(f"\n{len(rows)} run(s)")
+    return 0
 
 
 def _routing(args: argparse.Namespace) -> int:
