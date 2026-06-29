@@ -150,6 +150,19 @@ def test_runs_limit_zero_errors(db, capsys):
         assert "SENTINELGOAL" not in cap.out
 
 
+def test_runs_shows_batch_column(db, capsys):
+    """The runs table includes a BATCH column surfacing each run's
+    max_batch_size, so an operator sees whether a run batched internally."""
+    runs_db.record_start("batched-sess", "p", "engineer", "engineer", "do work", 1, "subagent")
+    runs_db.record_run_turn("batched-sess", 4)  # this run batched 4 calls in a turn
+
+    rc = _run(["runs"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "BATCH" in out  # column header present
+    assert "4" in out  # the max batch size for the run
+
+
 def test_runs_limit_valid_works(db, capsys):
     """Why: regression guard that a normal positive --limit still lists rows.
     What: --limit 5 returns 0 and prints the row.

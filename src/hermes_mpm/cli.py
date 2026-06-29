@@ -86,6 +86,24 @@ def setup(parser: argparse.ArgumentParser) -> None:
         help="Max rows to show (newest first), 1-1000. Default: 50.",
     )
 
+    parallelism_p = sub.add_parser(
+        "parallelism",
+        help=(
+            "Show the tool-call batch rate (is parallelism working?, no LLM): "
+            "overall + per-model, from per-turn tool-call counts."
+        ),
+    )
+    parallelism_p.add_argument(
+        "--since",
+        default=None,
+        help="Only turns within this window; <int><s|m|h|d>, e.g. 30m, 24h, 7d.",
+    )
+    parallelism_p.add_argument(
+        "--model",
+        default=None,
+        help="Restrict the rate to a single model id.",
+    )
+
     # Default action when `hermes mpm` is called bare.
     parser.set_defaults(mpm_action=None)
 
@@ -108,6 +126,8 @@ def handle(args: argparse.Namespace) -> int:
         return _gate_status_from_live_config()
     if action == "runs":
         return _runs(args)
+    if action == "parallelism":
+        return _parallelism(args)
 
     print(f"Unknown mpm action: {action!r}")
     return 2
@@ -209,7 +229,9 @@ def _runs(args: argparse.Namespace) -> int:
         return 0
 
     now = time.time()
-    header = f"{'RUN':<10} {'STATUS':<9} {'PROFILE':<12} {'AGE':>5} {'DUR':>7}  GOAL"
+    header = (
+        f"{'RUN':<10} {'STATUS':<9} {'PROFILE':<12} {'AGE':>5} {'DUR':>7} {'BATCH':>5}  GOAL"
+    )
     print(header)
     print("-" * len(header))
     for r in rows:
@@ -220,12 +242,69 @@ def _runs(args: argparse.Namespace) -> int:
         age = _fmt_age(now - started)
         dur_ms = r.get("duration_ms")
         dur = f"{dur_ms / 1000:.1f}s" if isinstance(dur_ms, (int, float)) else "-"
+        # BATCH = the run's largest single-turn tool-call count (max_batch_size).
+        # >1 means the run batched calls in parallel internally; "-" if never set.
+        mbs = r.get("max_batch_size")
+        batch = str(mbs) if isinstance(mbs, int) and mbs > 0 else "-"
         goal = (r.get("goal") or "").replace("\n", " ")
         if len(goal) > 48:
             goal = goal[:47] + "…"
-        print(f"{run_id:<10} {rstatus:<9} {profile:<12} {age:>5} {dur:>7}  {goal}")
+        print(f"{run_id:<10} {rstatus:<9} {profile:<12} {age:>5} {dur:>7} {batch:>5}  {goal}")
 
     print(f"\n{len(rows)} run(s)")
+    return 0
+
+
+def _parallelism(args: argparse.Namespace) -> int:
+    """Print the tool-call batch rate (overall + per model) — no LLM.
+
+    Why: The operator-facing answer to "is parallelism working?" — the fraction
+    of tool-emitting turns that batched more than one call. Computed from the
+    durable per-turn tool-call counts (turn_batches), replacing the old buggy
+    ad-hoc classifier with a trustworthy SELECT/GROUP BY number.
+    What: Resolves an optional ``--since`` window (same shorthand as ``runs``) and
+    ``--model`` filter, calls runs_db.batch_stats, and prints the overall rate +
+    tool-turn count + a per-model breakdown. Prints a clean notice and returns 0
+    when there is no data. Rejects an unparseable ``--since`` (stderr + exit 2)
+    and reports a DB read failure (exit 1) instead of crashing.
+    Test: ``test_parallelism_*`` in test_parallelism_cli.py.
+    """
+    from . import runs_db
+
+    try:
+        since = _parse_since(getattr(args, "since", None))
+    except ValueError as exc:
+        print(f"parallelism: {exc}", file=sys.stderr)
+        return 2
+    model = getattr(args, "model", None)
+
+    try:
+        stats = runs_db.batch_stats(since=since, model=model)
+    except Exception as exc:  # DB unreadable — report, don't crash the CLI
+        print(f"parallelism: could not read run DB: {exc}")
+        return 1
+
+    tool_turns = stats["tool_turns"]
+    if not tool_turns:
+        print("No tool-call turns recorded yet (no batch data).")
+        return 0
+
+    multi = stats["multi_tool_turns"]
+    rate = stats["batch_rate"]
+    print("MPM parallelism (tool-call batching)")
+    print(f"  overall batch rate: {rate * 100:.1f}%  ({multi}/{tool_turns} tool-turns batched >1)")
+    print("  by model:")
+    header = f"    {'MODEL':<28} {'RATE':>7} {'BATCHED':>8} {'TOOL-TURNS':>11}"
+    print(header)
+    # model is nullable (the hook records model=kw.get("model"), which can be
+    # None), so sort on a None-safe key — a bare sorted() raises TypeError when
+    # the store mixes a NULL-model turn with named-model turns.
+    for name, m in sorted(stats["by_model"].items(), key=lambda kv: kv[0] or ""):
+        mrate = m["batch_rate"] * 100
+        print(
+            f"    {(name or '?'):<28} {mrate:>6.1f}% "
+            f"{m['multi_tool_turns']:>8} {m['tool_turns']:>11}"
+        )
     return 0
 
 

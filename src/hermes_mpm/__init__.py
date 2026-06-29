@@ -321,6 +321,78 @@ def _make_post_tool_call_handler():
     return handler
 
 
+def _extract_tool_call_count(kw: dict) -> int:
+    """Resolve the assistant tool-call count for a post_api_request turn.
+
+    Why: The batch signal is "how many tool calls did the assistant emit this
+    turn" (>1 = parallel batch). The engine passes ``assistant_tool_call_count``
+    (verified in agent/conversation_loop.py), but we extract defensively so a core
+    that only carries the raw tool-call list still yields a count — a missing/odd
+    field must degrade to 0 (recorded as nothing), never raise.
+    What: Returns int(assistant_tool_call_count) when present and coercible; else
+    len(assistant_tool_calls) when that is a sized collection; else 0.
+    Test: ``test_post_api_request_derives_count_from_tool_calls_when_count_absent``
+    + the count==0 / swallow tests.
+    """
+    raw = kw.get("assistant_tool_call_count")
+    if raw is not None:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+    calls = kw.get("assistant_tool_calls")
+    try:
+        return len(calls) if calls is not None else 0
+    except TypeError:
+        return 0
+
+
+def _make_post_api_request_handler():
+    """Build the post_api_request hook → batch telemetry (turn + per-run).
+
+    Why: Per-turn tool-call counts are the trustworthy parallelism signal. This
+    hook fires once per LLM response for the MAIN agent AND every subagent, so it
+    is the single place that captures "is batching happening?" durably. It must
+    never raise into the engine — telemetry can never break a turn.
+    What: Returns handler(**kw) that extracts the tool-call count + session_id +
+    turn_id + api_request_id + model. When count >= 1 it records the global
+    turn-level signal (record_turn_batch, keyed by api_request_id) AND folds it
+    into the matching running subagent_run (record_run_turn, correlated by
+    session_id == run_id). count == 0 records nothing (no batch signal). A missing
+    api_request_id (no PK) is skipped cleanly. All errors are logged+swallowed.
+    Test: ``test_post_api_request_*`` in test_runs_hooks.py.
+    """
+
+    def handler(**kw) -> None:
+        try:
+            count = _extract_tool_call_count(kw)
+            if count < 1:
+                return  # a 0-tool turn carries no batch signal
+            session_id = kw.get("session_id") or ""
+            api_request_id = kw.get("api_request_id")
+            if not api_request_id:
+                return  # no PK to key the turn row on — skip cleanly
+            newly_recorded = runs_db.record_turn_batch(
+                turn_id=kw.get("turn_id"),
+                api_request_id=str(api_request_id),
+                session_id=session_id,
+                model=kw.get("model"),
+                tool_call_count=count,
+                ts=int(time.time()),
+            )
+            # Per-subagent fold: gated on the turn being NEWLY recorded so a
+            # duplicate hook fire (same api_request_id, deduped by OR IGNORE above)
+            # does not double-count turn_count. No-op for the main agent (its
+            # session_id matches no run row) and for unknown/ended runs.
+            if newly_recorded and session_id:
+                runs_db.record_run_turn(session_id=session_id, tool_call_count=count)
+        except Exception as exc:  # never break a turn — telemetry is observational
+            logger.debug("mpm-runs: post_api_request telemetry failed (ignored): %s", exc)
+
+    handler.__name__ = "hermes_mpm_runs_post_api_request"
+    return handler
+
+
 SKILL_NAME = "pm_orchestrator"
 _SKILL_PATH = Path(__file__).resolve().parent / "skills" / "pm_orchestrator" / "SKILL.md"
 
@@ -408,10 +480,13 @@ def _maybe_run_startup_maintenance() -> None:
             now = int(time.time())
             orphaned = runs_db.sweep_orphaned(now, os.getpid())
             purged = runs_db.purge_old(_RUNS_RETENTION_DAYS, now)
+            purged_turns = runs_db.purge_old_turn_batches(_RUNS_RETENTION_DAYS, now)
             logger.info(
-                "mpm-runs: startup maintenance — %d orphaned marked crashed, %d purged",
+                "mpm-runs: startup maintenance — %d orphaned marked crashed, "
+                "%d runs purged, %d turn-batches purged",
                 orphaned,
                 purged,
+                purged_turns,
             )
         except Exception as exc:  # never raise into the engine from a hook
             logger.warning("mpm-runs: startup maintenance failed (ignored): %s", exc)
@@ -663,6 +738,10 @@ def register(ctx) -> None:
         # marker can close it by EXACT delegation_id instead of goal text.
         ctx.register_hook("post_tool_call", _make_post_tool_call_handler())
         ctx.register_hook("pre_llm_call", _make_async_complete_handler())
+        # post_api_request fires once per LLM response (main agent + subagents);
+        # it records the per-turn tool-call batch count (the parallelism signal)
+        # and folds it into the matching subagent run's batch columns.
+        ctx.register_hook("post_api_request", _make_post_api_request_handler())
     except Exception as exc:
         logger.debug("hermes-mpm: run-tracking hooks skipped: %s", exc)
 

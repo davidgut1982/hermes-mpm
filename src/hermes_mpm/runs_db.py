@@ -74,11 +74,24 @@ CREATE TABLE IF NOT EXISTS subagent_runs (
     delegation_id     TEXT,
     run_type          TEXT,
     metadata          TEXT,
-    owner_pid         INTEGER
+    owner_pid         INTEGER,
+    max_batch_size    INTEGER,
+    turn_count        INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_runs_status  ON subagent_runs(status);
 CREATE INDEX IF NOT EXISTS idx_runs_parent  ON subagent_runs(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON subagent_runs(started_at);
+
+CREATE TABLE IF NOT EXISTS turn_batches (
+    api_request_id  TEXT PRIMARY KEY,
+    turn_id         TEXT,
+    session_id      TEXT,
+    model           TEXT,
+    tool_call_count INTEGER NOT NULL,
+    ts              INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_turn_batches_ts    ON turn_batches(ts);
+CREATE INDEX IF NOT EXISTS idx_turn_batches_model ON turn_batches(model);
 """
 
 
@@ -193,16 +206,21 @@ def init_db() -> None:
     CREATE/ALTER is what historically corrupted the kanban DB. Centralizing it
     here keeps record_start/record_end DDL-free. The ``owner_pid`` ALTER migrates
     DBs created before process-ownership existed so the orphan sweep can scope to
-    its own runs (the data-corruption fix).
+    its own runs (the data-corruption fix). The ``max_batch_size``/``turn_count``
+    ALTERs migrate DBs created before batch telemetry so each subagent run can
+    surface whether it batched internally.
     What: Opens a connection, executescript()s the IF NOT EXISTS schema (fresh DBs
-    get owner_pid in CREATE), then ALTER-adds owner_pid if an EXISTING table lacks
-    it — guarded by a PRAGMA column check so re-runs are a clean no-op.
-    Test: ``test_init_db_is_idempotent`` + ``test_init_db_adds_owner_pid_to_existing_db``.
+    get owner_pid + batch columns + turn_batches in CREATE), then ALTER-adds any
+    missing columns if an EXISTING table lacks them — each guarded by a PRAGMA
+    column check so re-runs are a clean no-op.
+    Test: ``test_init_db_is_idempotent`` + ``test_init_db_adds_owner_pid_to_existing_db``
+    + ``test_init_db_migrates_legacy_subagent_runs``.
     """
     conn = _connect()
     try:
         conn.executescript(_SCHEMA_SQL)
         _ensure_owner_pid_column(conn)
+        _ensure_batch_columns(conn)
     finally:
         conn.close()
 
@@ -222,6 +240,25 @@ def _ensure_owner_pid_column(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(subagent_runs)")}
     if "owner_pid" not in cols:
         conn.execute("ALTER TABLE subagent_runs ADD COLUMN owner_pid INTEGER")
+
+
+def _ensure_batch_columns(conn: sqlite3.Connection) -> None:
+    """Idempotently add max_batch_size/turn_count to an existing subagent_runs.
+
+    Why: A DB created before batch telemetry has neither column; record_run_turn
+    needs them to record per-subagent batch behaviour (did this run ever emit a
+    parallel tool batch, and how many turns did it take). CREATE TABLE IF NOT
+    EXISTS won't add columns to an existing table, so we migrate with guarded
+    ALTERs — mirroring the owner_pid migration.
+    What: Reads PRAGMA table_info; ALTER-adds each of max_batch_size / turn_count
+    that is absent. No-op when both already exist. Runs only inside init_db.
+    Test: ``test_init_db_migrates_legacy_subagent_runs`` (legacy DB + double init).
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(subagent_runs)")}
+    if "max_batch_size" not in cols:
+        conn.execute("ALTER TABLE subagent_runs ADD COLUMN max_batch_size INTEGER")
+    if "turn_count" not in cols:
+        conn.execute("ALTER TABLE subagent_runs ADD COLUMN turn_count INTEGER")
 
 
 def record_start(
@@ -527,3 +564,156 @@ def purge_old(retention_days: int, now: Optional[int] = None) -> int:
         "DELETE FROM subagent_runs WHERE ended_at IS NOT NULL AND ended_at < ?",
         (cutoff,),
     )
+
+
+# --- batch telemetry: per-turn tool-call counts ----------------------------
+
+
+def record_turn_batch(
+    turn_id: Optional[str],
+    api_request_id: str,
+    session_id: Optional[str],
+    model: Optional[str],
+    tool_call_count: int,
+    ts: int,
+) -> int:
+    """Record one LLM turn's assistant tool-call count (the batch signal).
+
+    Why: This is the global, queryable parallelism signal — one row per turn that
+    emitted >=1 tool call, for BOTH the main agent and every subagent. >1 means
+    the assistant batched tool calls in a single turn (parallelism working); 1
+    means a single call. Recording it durably lets ``batch_stats`` compute the
+    batch rate by SELECT/GROUP BY instead of a fragile ad-hoc classifier. Callers
+    record only turns with ``tool_call_count >= 1`` (a 0-tool turn carries no batch
+    signal); this writes whatever it is given.
+    What: INSERT OR IGNORE one row keyed by api_request_id (first write wins — the
+    post_api_request hook may fire more than once for a logically-single request),
+    using the same write-path/retry pattern as the rest of the module. Returns the
+    rowcount: 1 when the row was newly inserted, 0 on a duplicate (OR IGNORE) — so
+    the caller can gate the per-run fold (record_run_turn) on a NEW turn and avoid
+    double-counting turn_count on a duplicate fire.
+    Test: ``test_record_turn_batch_inserts_row`` +
+    ``test_record_turn_batch_idempotent_on_api_request_id`` +
+    ``test_record_turn_batch_returns_rowcount``.
+    """
+    return _write(
+        """
+        INSERT OR IGNORE INTO turn_batches (
+            api_request_id, turn_id, session_id, model, tool_call_count, ts
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (api_request_id, turn_id, session_id, model, int(tool_call_count), int(ts)),
+    )
+
+
+def batch_stats(
+    since: Optional[int] = None,
+    model: Optional[str] = None,
+) -> dict[str, Any]:
+    """Aggregate the turn-batch store into a parallelism scorecard.
+
+    Why: Backs ``hermes mpm parallelism`` — turns the raw per-turn rows into the
+    one number operators ask for: the batch rate (fraction of tool-turns that
+    batched >1 call), overall and per model. No LLM, no ad-hoc classifier.
+    What: SELECT/GROUP BY over turn_batches with optional ts>=since and model=
+    filters. Returns ``{tool_turns, multi_tool_turns, batch_rate, by_model}`` where
+    by_model maps each model to the same three numbers. batch_rate is
+    multi_tool_turns / tool_turns (0.0 when there are no tool-turns).
+    Test: ``test_batch_stats_computes_rate`` (3,1,2 -> rate 0.667),
+    ``test_batch_stats_empty_is_zero_rate``, ``test_batch_stats_per_model_breakdown``,
+    ``test_batch_stats_since_filter``, ``test_batch_stats_model_filter``.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if since is not None:
+        clauses.append("ts >= ?")
+        params.append(int(since))
+    if model:
+        clauses.append("model = ?")
+        params.append(model)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT model, COUNT(*) AS turns, "
+            "SUM(CASE WHEN tool_call_count > 1 THEN 1 ELSE 0 END) AS multi "
+            "FROM turn_batches" + where + " GROUP BY model",
+            tuple(params),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    tool_turns = 0
+    multi_tool_turns = 0
+    # Keys are the stored model id, which is nullable (the hook records
+    # model=kw.get("model")), so a None key is possible; callers must be None-safe.
+    by_model: dict[Optional[str], dict[str, Any]] = {}
+    for r in rows:
+        turns = int(r["turns"] or 0)
+        multi = int(r["multi"] or 0)
+        tool_turns += turns
+        multi_tool_turns += multi
+        by_model[r["model"]] = {
+            "tool_turns": turns,
+            "multi_tool_turns": multi,
+            "batch_rate": (multi / turns) if turns else 0.0,
+        }
+    return {
+        "tool_turns": tool_turns,
+        "multi_tool_turns": multi_tool_turns,
+        "batch_rate": (multi_tool_turns / tool_turns) if tool_turns else 0.0,
+        "by_model": by_model,
+    }
+
+
+def record_run_turn(session_id: str, tool_call_count: int) -> None:
+    """Fold one turn's batch signal into its running subagent_run row.
+
+    Why: ``hermes mpm runs`` should show, per subagent, whether that run ever
+    batched tool calls — without a second query. We correlate by
+    ``run_id == session_id``: the subagent_start hook stores the
+    child's ``session_id`` as ``run_id`` (verified in delegate_tool.py), and the
+    per-turn post_api_request hook carries that same ``session_id`` for the child's
+    turns. The MAIN agent's turns carry the parent session_id, which matches no run
+    row — so this is a correct no-op for the PM (the global turn_batches store
+    still captures it).
+    What: For the RUNNING run whose run_id == session_id, set turn_count =
+    COALESCE(turn_count,0)+1 and max_batch_size = MAX(COALESCE(max_batch_size,0),
+    tool_call_count). NOTE: the caller (the post_api_request hook) only invokes
+    this for turns with tool_call_count >= 1, so turn_count counts TOOL-EMITTING
+    turns, not total turns. No-op when no running run matches (unknown id, or
+    already ended — an ended run is left frozen). Uses the standard
+    write-path/retry.
+    Test: ``test_record_run_turn_updates_running_run``,
+    ``test_record_run_turn_max_logic_does_not_lower``,
+    ``test_record_run_turn_noop_when_no_matching_running_run``.
+    """
+    _write(
+        """
+        UPDATE subagent_runs
+           SET turn_count = COALESCE(turn_count, 0) + 1,
+               max_batch_size = MAX(COALESCE(max_batch_size, 0), ?)
+         WHERE run_id = ? AND status = ?
+        """,
+        (int(tool_call_count), session_id, STATUS_RUNNING),
+    )
+
+
+def purge_old_turn_batches(retention_days: int, now: Optional[int] = None) -> int:
+    """Delete turn-batch rows older than ``retention_days``. Returns rows deleted.
+
+    Why: Keeps the turn_batches table bounded without an external cron — called
+    from the same startup maintenance sweep as ``purge_old``. Turn rows are pure
+    telemetry (no in-flight state), so any row past the cutoff is safe to drop.
+    What: DELETEs rows with ts < (now - retention). A non-positive retention is a
+    no-op (retention disabled), mirroring ``purge_old``.
+    Test: ``test_purge_old_turn_batches_deletes_only_old`` +
+    ``test_purge_old_turn_batches_disabled_when_non_positive``.
+    """
+    if retention_days <= 0:
+        return 0
+    if now is None:
+        now = int(time.time())
+    cutoff = int(now) - retention_days * 86400
+    return _write("DELETE FROM turn_batches WHERE ts < ?", (cutoff,))
