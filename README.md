@@ -25,6 +25,10 @@ profile set.
   answer "what ran / is running / crashed" across gateway restarts.
 - **CLI** — `hermes mpm list-profiles`, `hermes mpm routing "<msg>"`
   (dry-run classifier), and `hermes mpm runs` (tracked-run table).
+- **Dashboard panel** (`dashboard/`) — an "MPM Runs" tab for the Hermes
+  dashboard that surfaces the same run history in the browser via a
+  **read-only** API, so an operator can watch live/finished subagent runs
+  without the CLI.
 
 ## How routing steers the model
 
@@ -172,6 +176,25 @@ a stderr error and exit code 2, rather than silently dumping an over-broad list.
 Retention defaults to 30 days; override it with `hermes_mpm.runs.retention_days`
 (see the configuration schema). A non-positive value disables purging.
 
+### Dashboard panel
+
+The same run history is also viewable in the Hermes dashboard. The plugin ships
+a self-contained dashboard panel under `dashboard/` (declared in
+`dashboard/manifest.json` as the **MPM Runs** tab, mounted after the kanban
+tab): a prebuilt frontend bundle (`dashboard/dist/`) plus a backend
+`dashboard/plugin_api.py` the host mounts at `/api/plugins/mpm-runs/`, exposing
+
+```
+GET /api/plugins/mpm-runs/runs        # filtered, newest-first (status|session|since|limit), plus server clock
+GET /api/plugins/mpm-runs/runs/stats  # status -> count aggregate (+ total)
+```
+
+The panel backend is deliberately **read-only and maintenance-free**: it owns a
+write-incapable (`query_only=ON`) reader connection, never runs the WAL/schema or
+restart-orphan sweep, and never creates `mpm_runs.db` — if the gateway hasn't
+created the DB yet, both routes degrade to empty results rather than touching it.
+This preserves the cross-process rule that only the gateway mutates run state.
+
 ## Layout
 
 ```
@@ -186,10 +209,15 @@ src/hermes_mpm/
   cluster_ops_client.py bounded cluster-ops MCP client (vendored)
   runs_db.py           durable SQLite run-tracking (init/record/sweep/query/purge)
   cli.py               `hermes mpm` (list-profiles + routing dry-run + runs)
+  dashboard/           "MPM Runs" dashboard panel
+    manifest.json      panel manifest (tab, icon, entry/css/api wiring)
+    plugin_api.py      read-only FastAPI router (/api/plugins/mpm-runs/)
+    dist/              prebuilt frontend bundle (index.js + style.css)
   skills/pm_orchestrator/SKILL.md
   data/profiles.default.yaml
   tests/               test_loads / test_routing / test_orchestrator / test_intent
                        / test_runs_db / test_runs_cli / test_runs_hooks
+                       / test_dashboard_plugin_api
 ```
 
 > Note: `system_prompt_file` paths in the shipped profiles point at
