@@ -14,15 +14,284 @@ registers a CLI command "mpm", a "pre_llm_call" hook, the
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import re
+import time
 from pathlib import Path
 
-from . import cli, intent, orchestrator, routing
+from . import cli, intent, orchestrator, routing, runs_db
 from . import pipeline as mpm_pipeline
 
 logger = logging.getLogger("hermes_mpm")
 
 CONFIG_NAMESPACE = "hermes_mpm"
+
+# Default run-retention when ``plugins.entries.hermes_mpm.runs.retention_days``
+# is unset. 30 days keeps recent history queryable without unbounded growth.
+DEFAULT_RETENTION_DAYS = 30
+
+# Maps the engine's child_status vocabulary (from the subagent_stop hook and the
+# async-complete marker) onto our terminal run statuses. Anything finished but
+# unrecognized is treated as ``failed`` — a completed-but-unclassified run is not
+# a success, so we fail closed.
+_CHILD_STATUS_MAP = {
+    "completed": runs_db.STATUS_DONE,
+    "success": runs_db.STATUS_DONE,
+    "done": runs_db.STATUS_DONE,
+    "error": runs_db.STATUS_FAILED,
+    "failed": runs_db.STATUS_FAILED,
+    "spawn_failed": runs_db.STATUS_FAILED,
+    "interrupted": runs_db.STATUS_FAILED,
+    "timed_out": runs_db.STATUS_TIMED_OUT,
+    "timeout": runs_db.STATUS_TIMED_OUT,
+    "crashed": runs_db.STATUS_CRASHED,
+}
+
+# Parser for the async-delegation completion marker re-injected as a user
+# message (see tools/process_registry._format_async_delegation). The header
+# carries the delegation_id; a later line carries the Status. We also read the
+# "Original goal:" line to correlate back to the start row (subagent_start does
+# NOT carry the delegation_id).
+_ASYNC_MARKER_PREFIX = "[ASYNC DELEGATION COMPLETE — deleg_"
+_RE_DELEG_ID = re.compile(r"\[ASYNC DELEGATION COMPLETE — (deleg_[0-9a-f]+)\]")
+_RE_ASYNC_STATUS = re.compile(r"^Status:\s*(\S+)", re.MULTILINE)
+_RE_ASYNC_GOAL = re.compile(r"^Original goal:\s*(.+)$", re.MULTILINE)
+# Duration appears inline on the Status line, e.g. "… Duration: 12s". Captured so
+# async runs record a duration like sync runs do (which get duration_ms from the
+# subagent_stop hook). Bare seconds only — the marker never emits sub-second.
+_RE_ASYNC_DURATION = re.compile(r"Duration:\s*(\d+)\s*s", re.IGNORECASE)
+
+
+def _parse_async_duration_ms(msg: str) -> int | None:
+    """Parse the ``Duration: Ns`` field from an async-complete marker → ms.
+
+    Why: Async runs are closed by the pre_llm_call fallback (not subagent_stop),
+    so without parsing the marker they'd show no duration while sync runs do. This
+    surfaces the wall-clock the engine already printed in the marker.
+    What: Returns the integer seconds from ``Duration: <N>s`` × 1000, or None when
+    the field is absent/malformed (record_end then leaves duration_ms NULL).
+    Test: ``test_async_complete_handler_parses_duration`` (5s → 5000).
+    """
+    m = _RE_ASYNC_DURATION.search(msg or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1)) * 1000
+    except (TypeError, ValueError):
+        return None
+
+
+def _map_child_status(child_status) -> str:
+    """Map an engine child_status onto our terminal run status (fail-closed).
+
+    Why: subagent_stop and the async marker speak the engine's vocabulary
+    (completed/error/timed_out/…); the DB stores our normalized statuses.
+    What: Case-insensitive lookup in _CHILD_STATUS_MAP; unknown/None → 'failed'.
+    Test: ``test_status_mapping_table``.
+    """
+    if not child_status:
+        return runs_db.STATUS_FAILED
+    return _CHILD_STATUS_MAP.get(str(child_status).strip().lower(), runs_db.STATUS_FAILED)
+
+
+def _make_subagent_start_handler():
+    """Build the subagent_start hook → record_start (running row).
+
+    Why: Every spawned child (sync OR async) fires subagent_start; this is where a
+    run becomes durable. Must never raise into the engine — a tracking failure
+    cannot be allowed to break a delegation.
+    What: Returns handler(**kw) that records a running row keyed by
+    child_session_id (run_id), run_type='subagent'. Wraps everything in
+    try/except that logs+swallows.
+    Test: ``test_subagent_start_handler_creates_running`` +
+    ``test_subagent_start_handler_swallows_db_error``.
+    """
+
+    def handler(**kw) -> None:
+        try:
+            run_id = kw.get("child_session_id")
+            if not run_id:
+                return  # nothing to key on — skip cleanly
+            runs_db.record_start(
+                run_id=str(run_id),
+                parent_session_id=kw.get("parent_session_id"),
+                role=kw.get("child_role"),
+                profile=kw.get("child_role"),  # best-effort: role doubles as profile
+                goal=kw.get("child_goal"),
+                started_at=int(time.time()),
+                run_type="subagent",
+            )
+        except Exception as exc:  # never break a delegation
+            logger.debug("mpm-runs: subagent_start tracking failed (ignored): %s", exc)
+
+    handler.__name__ = "hermes_mpm_runs_subagent_start"
+    return handler
+
+
+def _make_subagent_stop_handler():
+    """Build the subagent_stop hook → record_end (close the run).
+
+    Why: Closes sync (and any stop-firing) runs with their mapped terminal status
+    so they stop counting as in-flight. Async children do NOT fire this — they are
+    closed by the async-complete fallback below.
+    What: Returns handler(**kw) that maps child_status and UPDATEs the run by
+    child_session_id. Logs+swallows on error.
+    Test: ``test_subagent_stop_handler_closes_with_mapped_status`` +
+    ``test_subagent_stop_handler_swallows_db_error``.
+    """
+
+    def handler(**kw) -> None:
+        try:
+            run_id = kw.get("child_session_id")
+            if not run_id:
+                return
+            runs_db.record_end(
+                run_id=str(run_id),
+                status=_map_child_status(kw.get("child_status")),
+                ended_at=int(time.time()),
+                duration_ms=kw.get("duration_ms"),
+                summary=kw.get("child_summary"),
+            )
+        except Exception as exc:
+            logger.debug("mpm-runs: subagent_stop tracking failed (ignored): %s", exc)
+
+    handler.__name__ = "hermes_mpm_runs_subagent_stop"
+    return handler
+
+
+def _make_async_complete_handler():
+    """Build the pre_llm_call fallback that closes ASYNC runs.
+
+    Why: VERIFIED against tools/delegate_tool.py + tools/async_delegation.py —
+    background (fire-and-forget) children do NOT fire subagent_stop. Their result
+    re-enters the turn as a user message ``[ASYNC DELEGATION COMPLETE — deleg_…]``.
+    Without this handler those runs would be falsely marked ``crashed`` by the
+    next restart sweep. This closes them when the marker arrives.
+    What: Returns handler(**kw); if user_message starts with the async marker,
+    parse delegation_id + Status + Original goal, find the matching running run
+    (by delegation_id, else by goal), and record_end it. Always returns None
+    (never alters the turn). Logs+swallows on error.
+    Test: ``test_async_complete_handler_closes_run_by_goal`` +
+    ``test_async_complete_handler_ignores_non_marker``.
+    """
+
+    def handler(**kw):
+        try:
+            msg = (kw.get("user_message") or "").lstrip()
+            if not msg.startswith(_ASYNC_MARKER_PREFIX):
+                return None
+            m_id = _RE_DELEG_ID.search(msg)
+            delegation_id = m_id.group(1) if m_id else None
+            m_status = _RE_ASYNC_STATUS.search(msg)
+            status = _map_child_status(m_status.group(1) if m_status else None)
+            m_goal = _RE_ASYNC_GOAL.search(msg)
+            goal = m_goal.group(1).strip() if m_goal else None
+
+            # Correlate to the start row: delegation_id is most precise, but
+            # subagent_start does not carry it, so fall back to goal match.
+            run_id = None
+            if delegation_id:
+                run_id = runs_db.find_running_by_delegation(delegation_id)
+            if not run_id and goal:
+                run_id = runs_db.find_running_by_goal(goal)
+            if not run_id:
+                return None
+            runs_db.record_end(
+                run_id=run_id,
+                status=status,
+                ended_at=int(time.time()),
+                duration_ms=_parse_async_duration_ms(msg),
+            )
+            # Stamp the delegation_id onto the row for cross-ref if it wasn't set
+            # at start (the common case — start has no delegation_id).
+            if delegation_id:
+                runs_db._write(
+                    "UPDATE subagent_runs SET delegation_id = ? WHERE run_id = ?",
+                    (delegation_id, run_id),
+                )
+        except Exception as exc:
+            logger.debug("mpm-runs: async-complete tracking failed (ignored): %s", exc)
+        return None
+
+    handler.__name__ = "hermes_mpm_runs_async_complete"
+    return handler
+
+
+def _coerce_result_dict(result) -> dict | None:
+    """Best-effort coerce a tool result into a dict, else None.
+
+    Why: post_tool_call delivers ``delegate_task``'s result as either a JSON
+    string (the common case — delegate_tool returns ``json.dumps(...)``) or a
+    pre-parsed dict, depending on the call path. The stamping logic needs a dict
+    and must never raise on a malformed/odd-typed result.
+    What: Returns the dict unchanged; json.loads a str and returns it only if it
+    parses to a dict; returns None for anything else or on parse failure.
+    Test: ``test_post_tool_call_swallows_malformed_result_and_db_error`` (str/int/
+    missing) + the background-dispatch tests (str and dict forms).
+    """
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _is_background_dispatch(data: dict) -> bool:
+    """True iff a delegate_task result represents a background (async) dispatch.
+
+    Why: Only direct ``delegate_task(background=True)`` produces an async run that
+    needs delegation_id correlation; a SYNC result closes via subagent_stop and
+    must be left alone. The async result (delegate_tool.py) carries
+    ``delegation_id`` plus ``mode == "background"`` / ``status == "dispatched"``.
+    What: Returns True when a non-empty ``delegation_id`` is present AND
+    (mode == 'background' OR status == 'dispatched'). Sync results lack the id.
+    Test: background tests stamp; ``test_post_tool_call_ignores_sync_delegate_result``.
+    """
+    if not data.get("delegation_id"):
+        return False
+    return data.get("mode") == "background" or data.get("status") == "dispatched"
+
+
+def _make_post_tool_call_handler():
+    """Build the post_tool_call hook → stamp delegation_id onto the async run row.
+
+    Why: For a direct ``delegate_task(background=True)``, subagent_start creates
+    the run row (delegation_id NULL) and then delegate_task returns and fires this
+    SYNCHRONOUS post_tool_call carrying the delegation_id. Stamping it onto the
+    row lets the later async-complete marker close the run by EXACT delegation_id
+    rather than fragile goal-text matching (which breaks on truncation / shared
+    goals). Must never raise into the engine — post_tool_call is observational.
+    What: Returns handler(**kw); for tool_name == 'delegate_task' it coerces the
+    result to a dict and, if it is a background dispatch, calls
+    runs_db.stamp_delegation_id(goal, delegation_id). Sync results / other tools /
+    malformed results are no-ops. Logs+swallows on error.
+    Test: ``test_post_tool_call_*`` in test_runs_hooks.py.
+    """
+
+    def handler(**kw) -> None:
+        try:
+            if kw.get("tool_name") != "delegate_task":
+                return
+            data = _coerce_result_dict(kw.get("result"))
+            if not data or not _is_background_dispatch(data):
+                return  # sync dispatch / not a dispatch → subagent_stop closes it
+            delegation_id = data.get("delegation_id")
+            goal = data.get("goal")
+            if delegation_id and goal:
+                runs_db.stamp_delegation_id(str(goal), str(delegation_id))
+        except Exception as exc:  # never break the turn — observational hook
+            logger.debug("mpm-runs: post_tool_call stamping failed (ignored): %s", exc)
+
+    handler.__name__ = "hermes_mpm_runs_post_tool_call"
+    return handler
+
+
 SKILL_NAME = "pm_orchestrator"
 _SKILL_PATH = Path(__file__).resolve().parent / "skills" / "pm_orchestrator" / "SKILL.md"
 
@@ -57,6 +326,25 @@ def _read_config(ctx) -> dict:
     except Exception as exc:  # never block load on config read
         logger.debug("hermes-mpm: config read skipped: %s", exc)
         return {}
+
+
+def _runs_retention_days(cfg: dict) -> int:
+    """Resolve run-retention days from the merged plugin config.
+
+    Why: Operators need to bound run history without code changes; this reads
+    ``plugins.entries.hermes_mpm.runs.retention_days`` (surfaced into the merged
+    cfg under the ``runs`` key) with a 30-day default.
+    What: Returns cfg['runs']['retention_days'] as an int, or DEFAULT_RETENTION_DAYS
+    when absent/invalid. A non-positive value disables purging (handled by purge_old).
+    Test: ``test_runs_retention_days_reads_config`` + default fallback test.
+    """
+    try:
+        runs_cfg = cfg.get("runs") if isinstance(cfg, dict) else None
+        if isinstance(runs_cfg, dict) and "retention_days" in runs_cfg:
+            return int(runs_cfg["retention_days"])
+    except (TypeError, ValueError):
+        pass
+    return DEFAULT_RETENTION_DAYS
 
 
 def _make_pre_llm_call(cfg: dict):
@@ -266,6 +554,53 @@ def register(ctx) -> None:
         orchestrator.set_ctx(ctx)
     except Exception as exc:
         logger.debug("hermes-mpm: ctx capture for orchestrator skipped: %s", exc)
+
+    # 0) Run-tracking DB — startup lifecycle: init schema, then (GATEWAY ONLY)
+    #    sweep restart-orphaned runs + purge old ended rows. DDL runs ONLY here
+    #    (init_db), never on a hot hook path.
+    #
+    #    CRITICAL: register() runs in EVERY process that loads the plugin — the
+    #    gateway, but ALSO `hermes mpm runs` and the dashboard. The sweep/purge
+    #    are MUTATING; running them outside the gateway corrupted data (the CLI or
+    #    dashboard would mark the live gateway's in-flight runs ``crashed`` and
+    #    make async runs permanently un-closable). So we gate them behind
+    #    _HERMES_GATEWAY=1 — the env the gateway process sets (gateway/run.py) and
+    #    explicitly strips from its watcher/children. init_db (idempotent, additive
+    #    ALTER) is safe everywhere and still runs so the CLI sees current schema.
+    #    All best-effort: a tracking-DB failure must degrade hooks to no-ops, never
+    #    block plugin load.
+    try:
+        runs_db.init_db()
+        if os.environ.get("_HERMES_GATEWAY") == "1":
+            now = int(time.time())
+            orphaned = runs_db.sweep_orphaned(now, os.getpid())
+            retention_days = _runs_retention_days(cfg)
+            purged = runs_db.purge_old(retention_days, now)
+            logger.info(
+                "mpm-runs: db ready, %d orphaned run(s) marked crashed, %d old run(s) purged",
+                orphaned,
+                purged,
+            )
+        else:
+            logger.debug("mpm-runs: db ready (non-gateway process — sweep/purge skipped)")
+    except Exception as exc:
+        logger.warning("hermes-mpm: run-tracking DB init skipped: %s", exc)
+
+    # 0b) Subagent lifecycle hooks → run DB. subagent_start opens a run;
+    #     subagent_stop closes sync runs. Background/async children do NOT fire
+    #     subagent_stop (verified in delegate_tool.py/async_delegation.py), so a
+    #     pre_llm_call fallback closes them when the async-complete marker
+    #     re-enters the turn. Each handler swallows its own errors.
+    try:
+        ctx.register_hook("subagent_start", _make_subagent_start_handler())
+        ctx.register_hook("subagent_stop", _make_subagent_stop_handler())
+        # post_tool_call stamps the async delegation_id onto the run row created
+        # by subagent_start (delegation_id NULL at start), so the async-complete
+        # marker can close it by EXACT delegation_id instead of goal text.
+        ctx.register_hook("post_tool_call", _make_post_tool_call_handler())
+        ctx.register_hook("pre_llm_call", _make_async_complete_handler())
+    except Exception as exc:
+        logger.debug("hermes-mpm: run-tracking hooks skipped: %s", exc)
 
     # 1) `hermes mpm ...` CLI subcommand (REAL list-profiles).
     try:

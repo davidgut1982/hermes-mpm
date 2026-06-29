@@ -20,8 +20,11 @@ profile set.
   phrasings are rewritten to deterministic slash commands (`/weather`, `/time`,
   `/diskfree`, `/svcstatus`) that answer in-process — no LLM for those turns.
 - **Profiles** (`profiles.py`) — ships the default set of 22 agent archetypes.
-- **CLI** — `hermes mpm list-profiles` and `hermes mpm routing "<msg>"`
-  (dry-run classifier).
+- **Run tracking** (`runs_db.py`) — every subagent delegation (sync +
+  async/background) is recorded to a durable SQLite DB so `hermes mpm runs` can
+  answer "what ran / is running / crashed" across gateway restarts.
+- **CLI** — `hermes mpm list-profiles`, `hermes mpm routing "<msg>"`
+  (dry-run classifier), and `hermes mpm runs` (tracked-run table).
 
 ## How routing steers the model
 
@@ -116,6 +119,9 @@ hermes_mpm:
     provider: openrouter
     base_url: "https://openrouter.ai/api/v1"
     api_key_env: OPENROUTER_API_KEY          # secret read from env, never hardcoded
+
+  runs:                                      # run-tracking DB
+    retention_days: 30                       # purge ended runs older than this; <=0 disables
 ```
 
 A working example lives at `config.example.yaml`.
@@ -132,6 +138,34 @@ alongside the aggregated result. If every subtask is blocked, nothing is
 dispatched and the tool returns `{"error": ..., "blocked": [...]}`. v1 is
 caller-supplied subtasks (no LLM decomposition).
 
+## Run tracking
+
+Subagent lifecycle hooks (`subagent_start` / `subagent_stop`, plus a
+`pre_llm_call` fallback that closes async/background runs when their
+completion marker re-enters the turn) write every delegation to a durable
+SQLite DB at `<hermes_home>/mpm_runs.db`. Schema creation, restart-orphan
+sweeping (`running` rows left by a dead process are marked `crashed`), and
+retention purging happen at plugin load — the mutating sweep/purge run **only**
+in the gateway process (gated on `_HERMES_GATEWAY=1`) so the CLI and dashboard
+never corrupt live runs.
+
+Inspect runs with the no-LLM CLI:
+
+```bash
+hermes mpm runs                       # newest 50
+hermes mpm runs --status crashed      # filter by status (running|done|failed|crashed|timed_out)
+hermes mpm runs --session <id>        # filter by parent session
+hermes mpm runs --since 24h           # relative window: <int><s|m|h|d>
+hermes mpm runs --limit 200           # 1-1000, newest first (default 50)
+```
+
+It prints a fixed-width table (short run id, status, profile/role, age,
+duration, goal). An unparseable `--since` or a `--limit` below 1 is rejected with
+a stderr error and exit code 2, rather than silently dumping an over-broad list.
+
+Retention defaults to 30 days; override it with `hermes_mpm.runs.retention_days`
+(see the configuration schema). A non-positive value disables purging.
+
 ## Layout
 
 ```
@@ -144,10 +178,12 @@ src/hermes_mpm/
   intent.py            ported weather/time/disk/svc matchers + handler + commands
   weather_core.py      deterministic Open-Meteo core (vendored)
   cluster_ops_client.py bounded cluster-ops MCP client (vendored)
-  cli.py               `hermes mpm` (list-profiles + routing dry-run)
+  runs_db.py           durable SQLite run-tracking (init/record/sweep/query/purge)
+  cli.py               `hermes mpm` (list-profiles + routing dry-run + runs)
   skills/pm_orchestrator/SKILL.md
   data/profiles.default.yaml
   tests/               test_loads / test_routing / test_orchestrator / test_intent
+                       / test_runs_db / test_runs_cli / test_runs_hooks
 ```
 
 > Note: `system_prompt_file` paths in the shipped profiles point at
