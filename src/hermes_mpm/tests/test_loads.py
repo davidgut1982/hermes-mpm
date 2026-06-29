@@ -84,6 +84,42 @@ def test_profiles_load_real():
     assert "mcp-cluster-ops" in profiles.get_profile("ops")["toolsets"]
 
 
+def test_ops_profile_least_privilege_drops_skills():
+    """The ops profile must NOT carry the broad `skills` toolset.
+
+    Why: In the host engine the `skills` toolset is all-or-nothing — it maps to
+    skills_list + skill_view + skill_manage, and skill_manage can install/
+    uninstall skills, which is broader than an ops agent needs. Ops acts via
+    cluster-ops / proxmox / prometheus, not skill management. Dropping `skills`
+    enforces least-privilege structurally (tools outside the toolset are never
+    sent to the child model).
+    What: Asserts `skills` is absent from ops while its real ops MCP toolsets
+    (cluster-ops, proxmox, prometheus) remain present.
+    Test: This test — fails if `skills` is reintroduced to the ops profile, and
+    fails if an ops MCP toolset is accidentally dropped during the edit.
+    """
+    ops_toolsets = profiles.get_profile("ops")["toolsets"]
+    assert "skills" not in ops_toolsets
+    # Least-privilege must NOT collaterally remove the ops agent's real powers.
+    for required in ("mcp-cluster-ops", "mcp-proxmox", "mcp-prometheus"):
+        assert required in ops_toolsets
+
+
+def test_engineer_profile_unchanged_regression_guard():
+    """A representative non-ops profile keeps its legitimate broad toolsets.
+
+    Why: The ops tightening must be surgical — engineer/debugger legitimately
+    need terminal/file/code/skills. This guards against an over-broad edit that
+    strips capabilities from profiles that should keep them.
+    What: Asserts the engineer profile still includes terminal, file,
+    code_execution, and skills.
+    Test: This test — fails if the engineer profile loses any of those toolsets.
+    """
+    eng_toolsets = profiles.get_profile("engineer")["toolsets"]
+    for required in ("terminal", "file", "code_execution", "skills"):
+        assert required in eng_toolsets
+
+
 def test_cli_list_profiles_returns_zero(capsys):
     """`hermes mpm list-profiles` prints archetypes and exits 0."""
     parser = argparse.ArgumentParser()
@@ -110,18 +146,27 @@ def test_read_config_merges_top_level_and_entry(monkeypatch, tmp_path):
     """_read_config must merge top-level hermes_mpm (routing) over the entry
     block (gate), so routing sees its tiers and the gate keeps review_gate."""
     import yaml as _yaml
+
     home = tmp_path / "home"
     home.mkdir()
-    (home / "config.yaml").write_text(_yaml.safe_dump({
-        "hermes_mpm": {
-            "tiers": {"strong": {"model": "glm-5.2"}, "main": {"model": "glm-4.7"}},
-            "openrouter": {"provider": "zai"},
-        },
-        "plugins": {"entries": {"hermes_mpm": {
-            "review_gate": {"enabled": True},
-            "tiers": {"main": {"model": "old"}},
-        }}},
-    }))
+    (home / "config.yaml").write_text(
+        _yaml.safe_dump(
+            {
+                "hermes_mpm": {
+                    "tiers": {"strong": {"model": "glm-5.2"}, "main": {"model": "glm-4.7"}},
+                    "openrouter": {"provider": "zai"},
+                },
+                "plugins": {
+                    "entries": {
+                        "hermes_mpm": {
+                            "review_gate": {"enabled": True},
+                            "tiers": {"main": {"model": "old"}},
+                        }
+                    }
+                },
+            }
+        )
+    )
     monkeypatch.setenv("HERMES_HOME", str(home))
     cfg = hermes_mpm._read_config(object())
     # Top-level routing tiers win (strong present, main overwritten).

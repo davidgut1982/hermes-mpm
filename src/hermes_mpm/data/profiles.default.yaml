@@ -143,7 +143,12 @@ agent_profiles:
     provider: openrouter
     system_prompt_file: /opt/hermes/home/profiles/ops.md
     toolsets:
-      - skills
+      # `skills` removed for least-privilege: in the host engine it maps to
+      # skills_list + skill_view + skill_manage, and skill_manage can install/
+      # uninstall skills — broader than an ops agent needs. Ops acts via
+      # cluster-ops / proxmox / prometheus, not skill management. The engine's
+      # `skills` toolset is all-or-nothing (no read-only alias), so it is
+      # dropped entirely rather than narrowed.
       - mcp-proxmox
       - mcp-cluster-ops
       - mcp-prometheus
