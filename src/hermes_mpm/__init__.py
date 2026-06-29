@@ -582,9 +582,7 @@ def register(ctx) -> None:
                 purged,
             )
         else:
-            logger.debug(
-                "mpm-runs: db ready (non-gateway process — sweep/purge skipped)"
-            )
+            logger.debug("mpm-runs: db ready (non-gateway process — sweep/purge skipped)")
     except Exception as exc:
         logger.warning("hermes-mpm: run-tracking DB init skipped: %s", exc)
 

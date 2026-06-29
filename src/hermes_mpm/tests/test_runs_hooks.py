@@ -218,8 +218,7 @@ def test_register_does_not_sweep_when_not_gateway(db, monkeypatch):
     monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
     # A live run owned by some other (gateway) process.
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("live", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
     )
 
@@ -235,14 +234,12 @@ def test_register_sweeps_when_gateway(db, monkeypatch):
     monkeypatch.setenv("_HERMES_GATEWAY", "1")
     # Prior dead process's run — should be reaped.
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("prior", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
     )
     # This process's own run — should survive (current pid).
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("mine", runs_db.STATUS_RUNNING, 1, os.getpid()),
     )
 
@@ -353,13 +350,23 @@ def test_two_sequential_identical_goal_async_runs_close_independently(db):
     start(child_session_id="c1", parent_session_id="p", child_goal=goal)
     post(
         tool_name="delegate_task",
-        result={"status": "dispatched", "delegation_id": "deleg_a0000001", "goal": goal, "mode": "background"},
+        result={
+            "status": "dispatched",
+            "delegation_id": "deleg_a0000001",
+            "goal": goal,
+            "mode": "background",
+        },
     )
     # Second dispatch (same goal).
     start(child_session_id="c2", parent_session_id="p", child_goal=goal)
     post(
         tool_name="delegate_task",
-        result={"status": "dispatched", "delegation_id": "deleg_b0000002", "goal": goal, "mode": "background"},
+        result={
+            "status": "dispatched",
+            "delegation_id": "deleg_b0000002",
+            "goal": goal,
+            "mode": "background",
+        },
     )
 
     rows = _rows(db)
@@ -369,8 +376,16 @@ def test_two_sequential_identical_goal_async_runs_close_independently(db):
 
     # Each closes by its own delegation_id, in any order.
     handler = hermes_mpm._make_async_complete_handler()
-    handler(user_message="[ASYNC DELEGATION COMPLETE — deleg_b0000002]\nOriginal goal: x\nStatus: completed\n")
-    handler(user_message="[ASYNC DELEGATION COMPLETE — deleg_a0000001]\nOriginal goal: y\nStatus: error\n")
+    handler(
+        user_message=(
+            "[ASYNC DELEGATION COMPLETE — deleg_b0000002]\nOriginal goal: x\nStatus: completed\n"
+        )
+    )
+    handler(
+        user_message=(
+            "[ASYNC DELEGATION COMPLETE — deleg_a0000001]\nOriginal goal: y\nStatus: error\n"
+        )
+    )
 
     rows = _rows(db)
     assert rows["c2"]["status"] == "done"
@@ -399,7 +414,12 @@ def test_post_tool_call_ignores_other_tools(db):
     # Even a result that LOOKS like a dispatch must be ignored for other tools.
     post(
         tool_name="some_other_tool",
-        result={"status": "dispatched", "delegation_id": "deleg_x", "goal": "g", "mode": "background"},
+        result={
+            "status": "dispatched",
+            "delegation_id": "deleg_x",
+            "goal": "g",
+            "mode": "background",
+        },
     )
     assert _rows(db)["c"]["delegation_id"] is None
 
@@ -422,7 +442,12 @@ def test_post_tool_call_swallows_malformed_result_and_db_error(db, monkeypatch):
     monkeypatch.setattr(runs_db, "stamp_delegation_id", boom)
     post(
         tool_name="delegate_task",
-        result={"status": "dispatched", "delegation_id": "deleg_x", "goal": "g", "mode": "background"},
+        result={
+            "status": "dispatched",
+            "delegation_id": "deleg_x",
+            "goal": "g",
+            "mode": "background",
+        },
     )
 
 
@@ -442,7 +467,12 @@ def test_async_complete_prefers_delegation_id_over_goal(db):
     start(child_session_id="by-id", parent_session_id="p", child_goal="ambiguous")
     hermes_mpm._make_post_tool_call_handler()(
         tool_name="delegate_task",
-        result={"status": "dispatched", "delegation_id": "deleg_d1c10000", "goal": "ambiguous", "mode": "background"},
+        result={
+            "status": "dispatched",
+            "delegation_id": "deleg_d1c10000",
+            "goal": "ambiguous",
+            "mode": "background",
+        },
     )
     # A second running row sharing the goal but with NO delegation_id.
     start(child_session_id="by-goal", parent_session_id="p", child_goal="ambiguous")

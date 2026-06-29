@@ -317,7 +317,8 @@ def _gate_status_handler(raw_config: dict) -> int:
     cross_lab_note = (
         "SAME (would fail-closed on arm)"
         if same_lab
-        else "independent" if (orchestrator_lab and reviewer_lab)
+        else "independent"
+        if (orchestrator_lab and reviewer_lab)
         else f"UNKNOWN (orchestrator_lab={orchestrator_lab!r} — would fail-closed on arm)"
     )
 

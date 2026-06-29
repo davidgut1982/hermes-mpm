@@ -123,9 +123,7 @@ def _apply_wal_with_fallback(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError as exc:
         if not any(m in str(exc).lower() for m in _WAL_INCOMPAT_MARKERS):
             raise
-        logger.warning(
-            "mpm-runs: WAL unsupported on this filesystem (%s) — using DELETE", exc
-        )
+        logger.warning("mpm-runs: WAL unsupported on this filesystem (%s) — using DELETE", exc)
         conn.execute("PRAGMA journal_mode=DELETE")
 
 
@@ -402,11 +400,7 @@ def query_runs(
         clauses.append("started_at >= ?")
         params.append(int(since))
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-    sql = (
-        "SELECT * FROM subagent_runs"
-        + where
-        + " ORDER BY started_at DESC LIMIT ?"
-    )
+    sql = "SELECT * FROM subagent_runs" + where + " ORDER BY started_at DESC LIMIT ?"
     params.append(int(limit))
 
     conn = _connect()
@@ -439,9 +433,7 @@ def find_running_by_delegation(delegation_id: str) -> Optional[str]:
         conn.close()
 
 
-def stamp_delegation_id(
-    goal: str, delegation_id: str, now: Optional[int] = None
-) -> bool:
+def stamp_delegation_id(goal: str, delegation_id: str, now: Optional[int] = None) -> bool:
     """Stamp ``delegation_id`` onto the newest un-stamped running row for ``goal``.
 
     Why: For a direct ``delegate_task(background=True)`` the subagent_start hook

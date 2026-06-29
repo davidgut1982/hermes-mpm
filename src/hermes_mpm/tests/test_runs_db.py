@@ -79,9 +79,7 @@ def test_record_start_insert_or_ignore_is_idempotent(db):
 
 def test_record_end_closes_row(db):
     runs_db.record_start("c", "p", "r", None, "g", 1000, "subagent")
-    runs_db.record_end(
-        "c", status="done", ended_at=1005, duration_ms=5000, summary="ok"
-    )
+    runs_db.record_end("c", status="done", ended_at=1005, duration_ms=5000, summary="ok")
     r = _rows(db)[0]
     assert r["status"] == "done"
     assert r["ended_at"] == 1005
@@ -218,20 +216,17 @@ def test_sweep_orphaned_only_reaps_other_pid_rows(db, monkeypatch):
 
     # Row owned by a prior (dead) process — must be reaped.
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("prior", runs_db.STATUS_RUNNING, 1, prior_pid),
     )
     # Row with NULL owner_pid (legacy / pre-migration) — must be reaped.
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("legacy", runs_db.STATUS_RUNNING, 1, None),
     )
     # Row owned by the CURRENT process — must be left untouched.
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("mine", runs_db.STATUS_RUNNING, 1, current_pid),
     )
 
@@ -252,8 +247,7 @@ def test_sweep_orphaned_skips_alive_other_owner(db, monkeypatch):
     monkeypatch.setattr(runs_db, "_pid_alive", lambda pid: True)
     other_pid = os.getpid() + 1
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("alive_other", runs_db.STATUS_RUNNING, 1, other_pid),
     )
     n = runs_db.sweep_orphaned(now=500, current_pid=os.getpid())

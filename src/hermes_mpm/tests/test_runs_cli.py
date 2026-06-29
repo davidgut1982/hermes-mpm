@@ -48,12 +48,23 @@ def test_runs_empty(db, capsys):
 
 def test_runs_formats_rows(db, capsys):
     runs_db.record_start(
-        "child-session-aaaa", "p1", "engineer", "engineer",
-        "implement the parser", 1000, "subagent",
+        "child-session-aaaa",
+        "p1",
+        "engineer",
+        "engineer",
+        "implement the parser",
+        1000,
+        "subagent",
     )
     runs_db.record_end("child-session-aaaa", status="done", ended_at=1005, duration_ms=5000)
     runs_db.record_start(
-        "child-session-bbbb", "p1", "search", "search", "find news", 2000, "subagent",
+        "child-session-bbbb",
+        "p1",
+        "search",
+        "search",
+        "find news",
+        2000,
+        "subagent",
     )
 
     rc = _run(["runs"])
