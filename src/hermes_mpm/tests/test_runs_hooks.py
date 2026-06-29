@@ -274,6 +274,191 @@ def test_async_complete_handler_parses_duration(db):
     assert r["duration_ms"] == 5000
 
 
+def test_post_tool_call_stamps_delegation_id_on_background_dispatch(db):
+    """The direct-async happy path: subagent_start creates the run (delegation_id
+    NULL); post_tool_call with a background delegate_task result stamps the
+    delegation_id onto that row; the async-complete marker then closes it by
+    EXACT delegation_id."""
+    start = hermes_mpm._make_subagent_start_handler()
+    start(child_session_id="c-async", parent_session_id="p1", child_goal="ship report")
+    assert _rows(db)["c-async"]["delegation_id"] is None
+
+    # delegate_task returns a JSON STRING for a background dispatch.
+    result = (
+        '{"status": "dispatched", "delegation_id": "deleg_abc12345", '
+        '"goal": "ship report", "mode": "background", "note": "running"}'
+    )
+    post = hermes_mpm._make_post_tool_call_handler()
+    post(tool_name="delegate_task", result=result)
+
+    assert _rows(db)["c-async"]["delegation_id"] == "deleg_abc12345"
+
+    # async-complete marker closes by delegation_id.
+    marker = (
+        "[ASYNC DELEGATION COMPLETE — deleg_abc12345]\n"
+        "Original goal: ship report\n"
+        "Status: completed   Duration: 9s\n"
+        "--- RESULT ---\n"
+        "ok\n"
+    )
+    hermes_mpm._make_async_complete_handler()(user_message=marker)
+    r = _rows(db)["c-async"]
+    assert r["status"] == "done"
+    assert r["ended_at"] is not None
+
+
+def test_async_closure_by_delegation_id_survives_truncated_goal(db):
+    """TRUNCATION ROBUSTNESS: the marker's 'Original goal' is truncated/different
+    from the stored goal, but closure STILL succeeds because correlation is by
+    delegation_id — proving we no longer depend on goal text at completion."""
+    start = hermes_mpm._make_subagent_start_handler()
+    full_goal = "generate the very long nightly analytics report for region EMEA"
+    start(child_session_id="c-trunc", parent_session_id="p1", child_goal=full_goal)
+
+    # post_tool_call stamps the delegation_id (background dispatch carries the
+    # full goal at dispatch time).
+    result = {
+        "status": "dispatched",
+        "delegation_id": "deleg_70c99999",
+        "goal": full_goal,
+        "mode": "background",
+    }
+    hermes_mpm._make_post_tool_call_handler()(tool_name="delegate_task", result=result)
+
+    # The completion marker's goal is TRUNCATED — would not match by goal text.
+    marker = (
+        "[ASYNC DELEGATION COMPLETE — deleg_70c99999]\n"
+        "Original goal: generate the very long nightly analytics rep…\n"
+        "Status: completed   Duration: 30s\n"
+        "--- RESULT ---\n"
+        "done\n"
+    )
+    hermes_mpm._make_async_complete_handler()(user_message=marker)
+
+    r = _rows(db)["c-trunc"]
+    assert r["status"] == "done"  # closed despite the goal mismatch
+    assert r["duration_ms"] == 30000
+
+
+def test_two_sequential_identical_goal_async_runs_close_independently(db):
+    """Two SEQUENTIAL identical-goal direct-async runs: each subagent_start
+    creates a row; each post_tool_call stamps a DISTINCT delegation_id (the
+    ``delegation_id IS NULL`` filter disambiguates → no cross-stamp); each is
+    closed by its OWN delegation_id."""
+    start = hermes_mpm._make_subagent_start_handler()
+    post = hermes_mpm._make_post_tool_call_handler()
+    goal = "run the same job"
+
+    # First dispatch.
+    start(child_session_id="c1", parent_session_id="p", child_goal=goal)
+    post(
+        tool_name="delegate_task",
+        result={"status": "dispatched", "delegation_id": "deleg_a0000001", "goal": goal, "mode": "background"},
+    )
+    # Second dispatch (same goal).
+    start(child_session_id="c2", parent_session_id="p", child_goal=goal)
+    post(
+        tool_name="delegate_task",
+        result={"status": "dispatched", "delegation_id": "deleg_b0000002", "goal": goal, "mode": "background"},
+    )
+
+    rows = _rows(db)
+    # First stamp lands on the only row at the time (c1); second on c2.
+    assert rows["c1"]["delegation_id"] == "deleg_a0000001"
+    assert rows["c2"]["delegation_id"] == "deleg_b0000002"
+
+    # Each closes by its own delegation_id, in any order.
+    handler = hermes_mpm._make_async_complete_handler()
+    handler(user_message="[ASYNC DELEGATION COMPLETE — deleg_b0000002]\nOriginal goal: x\nStatus: completed\n")
+    handler(user_message="[ASYNC DELEGATION COMPLETE — deleg_a0000001]\nOriginal goal: y\nStatus: error\n")
+
+    rows = _rows(db)
+    assert rows["c2"]["status"] == "done"
+    assert rows["c1"]["status"] == "failed"
+
+
+def test_post_tool_call_ignores_sync_delegate_result(db):
+    """A SYNC delegate_task result (no background dispatch markers) must NOT
+    stamp anything — sync runs close via subagent_stop, not delegation_id."""
+    start = hermes_mpm._make_subagent_start_handler()
+    start(child_session_id="c-sync", parent_session_id="p", child_goal="sync work")
+
+    # A typical sync result: a plain summary string, no delegation_id / mode.
+    post = hermes_mpm._make_post_tool_call_handler()
+    post(tool_name="delegate_task", result='{"status": "completed", "summary": "done"}')
+    post(tool_name="delegate_task", result="just a plain text result")
+
+    assert _rows(db)["c-sync"]["delegation_id"] is None
+
+
+def test_post_tool_call_ignores_other_tools(db):
+    """post_tool_call for a non-delegate_task tool is a no-op."""
+    start = hermes_mpm._make_subagent_start_handler()
+    start(child_session_id="c", parent_session_id="p", child_goal="g")
+    post = hermes_mpm._make_post_tool_call_handler()
+    # Even a result that LOOKS like a dispatch must be ignored for other tools.
+    post(
+        tool_name="some_other_tool",
+        result={"status": "dispatched", "delegation_id": "deleg_x", "goal": "g", "mode": "background"},
+    )
+    assert _rows(db)["c"]["delegation_id"] is None
+
+
+def test_post_tool_call_swallows_malformed_result_and_db_error(db, monkeypatch):
+    """The post_tool_call handler must never raise into the engine: a malformed
+    result and a DB error are both swallowed."""
+    post = hermes_mpm._make_post_tool_call_handler()
+    # Malformed JSON string — must not raise.
+    post(tool_name="delegate_task", result="{not valid json")
+    # Non-str/dict result — must not raise.
+    post(tool_name="delegate_task", result=12345)
+    # Missing result kw — must not raise.
+    post(tool_name="delegate_task")
+
+    # DB error path: stamp raises → swallowed.
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("simulated failure")
+
+    monkeypatch.setattr(runs_db, "stamp_delegation_id", boom)
+    post(
+        tool_name="delegate_task",
+        result={"status": "dispatched", "delegation_id": "deleg_x", "goal": "g", "mode": "background"},
+    )
+
+
+def test_register_wires_post_tool_call_hook(monkeypatch, tmp_path):
+    """register(ctx) registers a post_tool_call hook for delegation stamping."""
+    monkeypatch.setattr(runs_db, "_db_path", lambda: tmp_path / "mpm_runs.db")
+    ctx = _FakeCtx()
+    hermes_mpm.register(ctx)
+    assert "post_tool_call" in ctx.hooks
+
+
+def test_async_complete_prefers_delegation_id_over_goal(db):
+    """When BOTH a delegation_id match and a goal match exist, the handler closes
+    by delegation_id (exact) — the goal-matching row is left alone."""
+    start = hermes_mpm._make_subagent_start_handler()
+    # Row that will be stamped + matched by delegation_id.
+    start(child_session_id="by-id", parent_session_id="p", child_goal="ambiguous")
+    hermes_mpm._make_post_tool_call_handler()(
+        tool_name="delegate_task",
+        result={"status": "dispatched", "delegation_id": "deleg_d1c10000", "goal": "ambiguous", "mode": "background"},
+    )
+    # A second running row sharing the goal but with NO delegation_id.
+    start(child_session_id="by-goal", parent_session_id="p", child_goal="ambiguous")
+
+    marker = (
+        "[ASYNC DELEGATION COMPLETE — deleg_d1c10000]\n"
+        "Original goal: ambiguous\n"
+        "Status: completed\n"
+    )
+    hermes_mpm._make_async_complete_handler()(user_message=marker)
+
+    rows = _rows(db)
+    assert rows["by-id"]["status"] == "done"  # closed by exact delegation_id
+    assert rows["by-goal"]["status"] == "running"  # untouched
+
+
 def test_async_run_end_to_end_not_swept_then_closed(db, monkeypatch):
     """Full async lifecycle: started (running) → a CLI/non-gateway register()
     runs (must NOT sweep it) → closed by the async-complete marker (done).

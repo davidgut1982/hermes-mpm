@@ -14,6 +14,7 @@ registers a CLI command "mpm", a "pre_llm_call" hook, the
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -216,6 +217,81 @@ def _make_async_complete_handler():
 
     handler.__name__ = "hermes_mpm_runs_async_complete"
     return handler
+
+
+def _coerce_result_dict(result) -> dict | None:
+    """Best-effort coerce a tool result into a dict, else None.
+
+    Why: post_tool_call delivers ``delegate_task``'s result as either a JSON
+    string (the common case — delegate_tool returns ``json.dumps(...)``) or a
+    pre-parsed dict, depending on the call path. The stamping logic needs a dict
+    and must never raise on a malformed/odd-typed result.
+    What: Returns the dict unchanged; json.loads a str and returns it only if it
+    parses to a dict; returns None for anything else or on parse failure.
+    Test: ``test_post_tool_call_swallows_malformed_result_and_db_error`` (str/int/
+    missing) + the background-dispatch tests (str and dict forms).
+    """
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _is_background_dispatch(data: dict) -> bool:
+    """True iff a delegate_task result represents a background (async) dispatch.
+
+    Why: Only direct ``delegate_task(background=True)`` produces an async run that
+    needs delegation_id correlation; a SYNC result closes via subagent_stop and
+    must be left alone. The async result (delegate_tool.py) carries
+    ``delegation_id`` plus ``mode == "background"`` / ``status == "dispatched"``.
+    What: Returns True when a non-empty ``delegation_id`` is present AND
+    (mode == 'background' OR status == 'dispatched'). Sync results lack the id.
+    Test: background tests stamp; ``test_post_tool_call_ignores_sync_delegate_result``.
+    """
+    if not data.get("delegation_id"):
+        return False
+    return data.get("mode") == "background" or data.get("status") == "dispatched"
+
+
+def _make_post_tool_call_handler():
+    """Build the post_tool_call hook → stamp delegation_id onto the async run row.
+
+    Why: For a direct ``delegate_task(background=True)``, subagent_start creates
+    the run row (delegation_id NULL) and then delegate_task returns and fires this
+    SYNCHRONOUS post_tool_call carrying the delegation_id. Stamping it onto the
+    row lets the later async-complete marker close the run by EXACT delegation_id
+    rather than fragile goal-text matching (which breaks on truncation / shared
+    goals). Must never raise into the engine — post_tool_call is observational.
+    What: Returns handler(**kw); for tool_name == 'delegate_task' it coerces the
+    result to a dict and, if it is a background dispatch, calls
+    runs_db.stamp_delegation_id(goal, delegation_id). Sync results / other tools /
+    malformed results are no-ops. Logs+swallows on error.
+    Test: ``test_post_tool_call_*`` in test_runs_hooks.py.
+    """
+
+    def handler(**kw) -> None:
+        try:
+            if kw.get("tool_name") != "delegate_task":
+                return
+            data = _coerce_result_dict(kw.get("result"))
+            if not data or not _is_background_dispatch(data):
+                return  # sync dispatch / not a dispatch → subagent_stop closes it
+            delegation_id = data.get("delegation_id")
+            goal = data.get("goal")
+            if delegation_id and goal:
+                runs_db.stamp_delegation_id(str(goal), str(delegation_id))
+        except Exception as exc:  # never break the turn — observational hook
+            logger.debug("mpm-runs: post_tool_call stamping failed (ignored): %s", exc)
+
+    handler.__name__ = "hermes_mpm_runs_post_tool_call"
+    return handler
+
+
 SKILL_NAME = "pm_orchestrator"
 _SKILL_PATH = Path(__file__).resolve().parent / "skills" / "pm_orchestrator" / "SKILL.md"
 
@@ -520,6 +596,10 @@ def register(ctx) -> None:
     try:
         ctx.register_hook("subagent_start", _make_subagent_start_handler())
         ctx.register_hook("subagent_stop", _make_subagent_stop_handler())
+        # post_tool_call stamps the async delegation_id onto the run row created
+        # by subagent_start (delegation_id NULL at start), so the async-complete
+        # marker can close it by EXACT delegation_id instead of goal text.
+        ctx.register_hook("post_tool_call", _make_post_tool_call_handler())
         ctx.register_hook("pre_llm_call", _make_async_complete_handler())
     except Exception as exc:
         logger.debug("hermes-mpm: run-tracking hooks skipped: %s", exc)

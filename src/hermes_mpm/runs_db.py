@@ -439,27 +439,79 @@ def find_running_by_delegation(delegation_id: str) -> Optional[str]:
         conn.close()
 
 
-def find_running_by_goal(goal: str) -> Optional[str]:
-    """Return the run_id of the newest running row whose goal matches.
+def stamp_delegation_id(
+    goal: str, delegation_id: str, now: Optional[int] = None
+) -> bool:
+    """Stamp ``delegation_id`` onto the newest un-stamped running row for ``goal``.
 
-    Why: subagent_start does NOT carry the async delegation_id, so an
-    async-complete marker (which carries delegation_id + goal, not the child
-    session id) can only be correlated to its start row by goal. This is the
-    best-effort bridge that keeps async runs from being falsely crash-swept.
-    What: SELECTs the newest running run_id with an exact goal match.
-    Test: Exercised via the hook-fallback test in test_init_register.py.
+    Why: For a direct ``delegate_task(background=True)`` the subagent_start hook
+    creates the run row (delegation_id NULL) BEFORE delegate_task returns; the
+    synchronous post_tool_call then carries the delegation_id. Stamping it here
+    lets the async-complete marker close the run by EXACT delegation_id instead
+    of fragile goal-text matching. The ``delegation_id IS NULL`` filter is the
+    disambiguator for two sequential identical-goal async runs: the second stamp
+    cannot overwrite the first (it falls through to the next still-null row).
+    What: Finds the newest ``running`` row with this goal AND delegation_id NULL
+    (SELECT by run_id, then UPDATE by run_id — portable across SQLite builds that
+    lack UPDATE…ORDER BY/LIMIT), sets its delegation_id. Returns True iff a row
+    was stamped. ``now`` is accepted for signature symmetry with other writers
+    (unused here — no timestamp is mutated).
+    Test: ``test_stamp_delegation_id_*`` in test_runs_db.py.
     """
+    del now  # accepted for symmetry; this write mutates no timestamp
     conn = _connect()
     try:
         row = conn.execute(
             """
             SELECT run_id FROM subagent_runs
-             WHERE goal = ? AND status = ?
+             WHERE goal = ? AND status = ? AND delegation_id IS NULL
              ORDER BY started_at DESC LIMIT 1
             """,
             (goal, STATUS_RUNNING),
         ).fetchone()
-        return row["run_id"] if row else None
+        run_id = row["run_id"] if row else None
+    finally:
+        conn.close()
+    if run_id is None:
+        return False
+    # Re-assert the NULL guard in the UPDATE so a concurrent stamp can't double-write.
+    updated = _write(
+        """
+        UPDATE subagent_runs SET delegation_id = ?
+         WHERE run_id = ? AND delegation_id IS NULL
+        """,
+        (delegation_id, run_id),
+    )
+    return updated > 0
+
+
+def find_running_by_goal(goal: str) -> Optional[str]:
+    """Return the run_id of the SOLE running row whose goal matches, else None.
+
+    Why: This is now only a LAST-RESORT fallback — delegation_id correlation
+    (stamp_delegation_id + find_running_by_delegation) is the primary path. Goal
+    text at completion can be truncated/reformatted, and two async runs can share
+    a goal, so this must never GUESS: if more than one running row matches, return
+    None and leave the ambiguous pair for the honest crash-sweep rather than
+    closing the wrong row.
+    What: Counts running rows with an exact goal match; returns the run_id only
+    when EXACTLY one matches (ambiguity guard), else None.
+    Test: ``test_find_running_by_goal_returns_none_when_ambiguous`` +
+    ``test_find_running_by_goal_returns_single_match``.
+    """
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT run_id FROM subagent_runs
+             WHERE goal = ? AND status = ?
+             ORDER BY started_at DESC
+            """,
+            (goal, STATUS_RUNNING),
+        ).fetchall()
+        if len(rows) != 1:
+            return None  # 0 = no match; >1 = ambiguous, do NOT guess
+        return rows[0]["run_id"]
     finally:
         conn.close()
 

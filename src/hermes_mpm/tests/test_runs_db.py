@@ -306,3 +306,96 @@ def _pragma_cols(path):
         return [dict(r) for r in conn.execute("PRAGMA table_info(subagent_runs)")]
     finally:
         conn.close()
+
+
+# --- delegation_id correlation: stamp + ambiguity guard -------------------
+
+
+def test_stamp_delegation_id_stamps_newest_null_running_row(db):
+    """stamp_delegation_id stamps the newest matching un-stamped running row.
+
+    Why: direct-async subagent_start creates the row with delegation_id NULL;
+    the synchronous post_tool_call later carries the delegation_id and must
+    stamp it onto that exact row so the async-complete marker can close it by
+    id. Two rows share the goal here — only the NEWEST null-delegation running
+    one must be stamped.
+    What: two running rows same goal (older started_at, newer started_at), both
+    delegation_id NULL → stamp targets the newer; returns True.
+    Test: this test.
+    """
+    runs_db.record_start("old", "p", "r", None, "shared goal", 100, "subagent")
+    runs_db.record_start("new", "p", "r", None, "shared goal", 200, "subagent")
+
+    stamped = runs_db.stamp_delegation_id("shared goal", "deleg_aaaa1111")
+    assert stamped is True
+
+    rows = {r["run_id"]: r for r in _rows(db)}
+    assert rows["new"]["delegation_id"] == "deleg_aaaa1111"
+    assert rows["old"]["delegation_id"] is None  # untouched
+
+
+def test_stamp_delegation_id_skips_already_stamped_rows(db):
+    """The ``delegation_id IS NULL`` filter prevents cross-stamping a row that
+    already carries a delegation_id — the disambiguator for sequential
+    identical-goal async runs.
+
+    Why: two sequential identical-goal async dispatches each get their own
+    post_tool_call; the second must NOT overwrite the first's delegation_id.
+    What: stamp the newest row, then stamp again for the same goal → the second
+    stamp lands on the OLDER still-null row (not the already-stamped newest).
+    Test: this test.
+    """
+    runs_db.record_start("first", "p", "r", None, "g", 100, "subagent")
+    runs_db.record_start("second", "p", "r", None, "g", 200, "subagent")
+
+    # First dispatch's post_tool_call stamps the newest (second) row.
+    assert runs_db.stamp_delegation_id("g", "deleg_second") is True
+    # Second dispatch's post_tool_call must fall through to the older null row.
+    assert runs_db.stamp_delegation_id("g", "deleg_first") is True
+
+    rows = {r["run_id"]: r for r in _rows(db)}
+    assert rows["second"]["delegation_id"] == "deleg_second"
+    assert rows["first"]["delegation_id"] == "deleg_first"
+
+
+def test_stamp_delegation_id_returns_false_when_no_match(db):
+    """No running null-delegation row for the goal → returns False, no write."""
+    # A row that does NOT match (different goal).
+    runs_db.record_start("x", "p", "r", None, "other", 1, "subagent")
+    assert runs_db.stamp_delegation_id("nonexistent goal", "deleg_zzz") is False
+    # A running row whose goal matches but is ALREADY stamped — still no match.
+    runs_db.record_start("y", "p", "r", None, "taken", 1, "subagent", delegation_id="d0")
+    assert runs_db.stamp_delegation_id("taken", "deleg_new") is False
+
+
+def test_stamp_delegation_id_ignores_ended_rows(db):
+    """Only RUNNING rows are eligible — an ended row of the same goal is skipped."""
+    runs_db.record_start("done", "p", "r", None, "g", 1, "subagent")
+    runs_db.record_end("done", status="done", ended_at=2)
+    assert runs_db.stamp_delegation_id("g", "deleg_x") is False
+    assert _rows(db)[0]["delegation_id"] is None
+
+
+def test_find_running_by_goal_returns_none_when_ambiguous(db):
+    """AMBIGUITY GUARD: >1 running row matches the goal → return None.
+
+    Why: goal-match is now only a last-resort fallback. If two async runs share
+    a goal and neither was stamped, we must NOT guess which to close — closing
+    the wrong one corrupts data. Returning None leaves the ambiguous pair for
+    the honest crash-sweep instead.
+    What: two running rows same goal → find_running_by_goal returns None.
+    Test: this test.
+    """
+    runs_db.record_start("a", "p", "r", None, "dup goal", 100, "subagent")
+    runs_db.record_start("b", "p", "r", None, "dup goal", 200, "subagent")
+    assert runs_db.find_running_by_goal("dup goal") is None
+
+
+def test_find_running_by_goal_returns_single_match(db):
+    """The guard does not break the unambiguous case: exactly one running row
+    matching the goal is still returned."""
+    runs_db.record_start("only", "p", "r", None, "unique goal", 1, "subagent")
+    # An ended row with the same goal must not count toward ambiguity.
+    runs_db.record_start("ended", "p", "r", None, "unique goal", 2, "subagent")
+    runs_db.record_end("ended", status="done", ended_at=3)
+    assert runs_db.find_running_by_goal("unique goal") == "only"
