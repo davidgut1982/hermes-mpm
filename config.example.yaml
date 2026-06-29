@@ -93,7 +93,8 @@ hermes_mpm:
 
   # Durable subagent run tracking (the `hermes mpm runs` read surface). Runs land
   # in <hermes_home>/mpm_runs.db; ended rows older than retention_days are purged
-  # at gateway startup. A non-positive value disables purging (keep all history).
+  # once on the gateway's first hook. A non-positive value disables purging (keep
+  # all history).
   runs:
     retention_days: 30
 
