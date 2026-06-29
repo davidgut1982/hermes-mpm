@@ -634,6 +634,153 @@ def test_register_wires_post_tool_call_hook(monkeypatch, tmp_path):
     assert "post_tool_call" in ctx.hooks
 
 
+def test_post_api_request_records_multi_tool_turn_and_bumps_run(db):
+    """count>1: records a turn_batches row AND bumps the matching running run's
+    max_batch_size/turn_count (correlated by session_id == run_id)."""
+    start = hermes_mpm._make_subagent_start_handler()
+    start(child_session_id="run-s1", parent_session_id="p1", child_goal="g")
+
+    handler = hermes_mpm._make_post_api_request_handler()
+    handler(
+        assistant_tool_call_count=3,
+        session_id="run-s1",
+        turn_id="t1",
+        api_request_id="api-1",
+        model="glm-4.6",
+    )
+
+    # Global turn-level signal recorded.
+    stats = runs_db.batch_stats()
+    assert stats["tool_turns"] == 1
+    assert stats["multi_tool_turns"] == 1
+    # Per-subagent batch columns bumped.
+    r = _rows(db)["run-s1"]
+    assert r["turn_count"] == 1
+    assert r["max_batch_size"] == 3
+
+
+def test_post_api_request_duplicate_fire_does_not_double_count_turn(db):
+    """The hook may fire more than once for a logically-single request (same
+    api_request_id). record_turn_batch dedups via INSERT OR IGNORE; the per-run
+    fold must be gated on the turn being NEWLY recorded so turn_count is not
+    double-counted on a duplicate fire (max_batch_size stays correct either way)."""
+    start = hermes_mpm._make_subagent_start_handler()
+    start(child_session_id="run-s1", parent_session_id="p1", child_goal="g")
+
+    handler = hermes_mpm._make_post_api_request_handler()
+    kw = dict(
+        assistant_tool_call_count=3,
+        session_id="run-s1",
+        turn_id="t1",
+        api_request_id="api-1",
+        model="m",
+    )
+    handler(**kw)
+    handler(**kw)  # duplicate fire, same api_request_id
+
+    # Exactly one turn-batch row (OR IGNORE) AND turn_count counted once.
+    assert runs_db.batch_stats()["tool_turns"] == 1
+    r = _rows(db)["run-s1"]
+    assert r["turn_count"] == 1
+    assert r["max_batch_size"] == 3
+
+
+def test_post_api_request_count_zero_records_nothing(db):
+    """count==0 (no tools that turn) carries no batch signal — record nothing."""
+    start = hermes_mpm._make_subagent_start_handler()
+    start(child_session_id="run-s1", parent_session_id="p1", child_goal="g")
+
+    handler = hermes_mpm._make_post_api_request_handler()
+    handler(
+        assistant_tool_call_count=0,
+        session_id="run-s1",
+        turn_id="t1",
+        api_request_id="api-1",
+        model="m",
+    )
+
+    assert runs_db.batch_stats()["tool_turns"] == 0
+    r = _rows(db)["run-s1"]
+    assert (r["turn_count"] or 0) == 0
+    assert (r["max_batch_size"] or 0) == 0
+
+
+def test_post_api_request_single_tool_turn_recorded_not_multi(db):
+    """count==1: recorded as a tool-turn but not a multi-tool turn."""
+    handler = hermes_mpm._make_post_api_request_handler()
+    handler(
+        assistant_tool_call_count=1,
+        session_id="main-session",
+        turn_id="t1",
+        api_request_id="api-1",
+        model="m",
+    )
+    stats = runs_db.batch_stats()
+    assert stats["tool_turns"] == 1
+    assert stats["multi_tool_turns"] == 0
+
+
+def test_post_api_request_swallows_db_error(db, monkeypatch):
+    """A DB failure inside the hook must never raise into the engine."""
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("simulated failure")
+
+    monkeypatch.setattr(runs_db, "record_turn_batch", boom)
+    handler = hermes_mpm._make_post_api_request_handler()
+    # Must NOT raise.
+    handler(assistant_tool_call_count=2, session_id="s", api_request_id="api-1", model="m")
+
+
+def test_post_api_request_derives_count_from_tool_calls_when_count_absent(db):
+    """If assistant_tool_call_count is absent, derive the count from a carried
+    list of assistant tool_calls (defensive kwarg extraction)."""
+    handler = hermes_mpm._make_post_api_request_handler()
+    handler(
+        session_id="s",
+        turn_id="t1",
+        api_request_id="api-1",
+        model="m",
+        assistant_tool_calls=[{"id": "1"}, {"id": "2"}],
+    )
+    stats = runs_db.batch_stats()
+    assert stats["tool_turns"] == 1
+    assert stats["multi_tool_turns"] == 1
+
+
+def test_post_api_request_no_api_request_id_is_noop(db):
+    """Without an api_request_id there is no PK to key on — skip cleanly."""
+    handler = hermes_mpm._make_post_api_request_handler()
+    handler(assistant_tool_call_count=3, session_id="s", model="m")
+    assert runs_db.batch_stats()["tool_turns"] == 0
+
+
+def test_register_wires_post_api_request_hook(monkeypatch, tmp_path):
+    """register(ctx) registers a post_api_request hook for batch telemetry."""
+    monkeypatch.setattr(runs_db, "_db_path", lambda: tmp_path / "mpm_runs.db")
+    ctx = _FakeCtx()
+    hermes_mpm.register(ctx)
+    assert "post_api_request" in ctx.hooks
+
+
+def test_maybe_startup_maintenance_purges_turn_batches(db, monkeypatch):
+    """The lazy startup maintenance also purges old turn_batches rows."""
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.setattr(runs_db, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(hermes_mpm, "_RUNS_RETENTION_DAYS", 1)
+    # An ancient turn-batch row that must be purged.
+    runs_db.record_turn_batch("t-old", "a-old", "s", "m", 2, 10)
+    # A recent one that must survive.
+    import time as _t
+
+    runs_db.record_turn_batch("t-new", "a-new", "s", "m", 2, int(_t.time()))
+
+    hermes_mpm._maybe_run_startup_maintenance()
+
+    stats = runs_db.batch_stats()
+    assert stats["tool_turns"] == 1  # only the recent row remains
+
+
 def test_async_complete_prefers_delegation_id_over_goal(db):
     """When BOTH a delegation_id match and a goal match exist, the handler closes
     by delegation_id (exact) — the goal-matching row is left alone."""

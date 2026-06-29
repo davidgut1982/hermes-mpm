@@ -23,8 +23,14 @@ profile set.
 - **Run tracking** (`runs_db.py`) — every subagent delegation (sync +
   async/background) is recorded to a durable SQLite DB so `hermes mpm runs` can
   answer "what ran / is running / crashed" across gateway restarts.
+- **Batch telemetry** (`runs_db.py`) — a `post_api_request` hook records each
+  LLM turn's assistant tool-call count (main agent + every subagent) so
+  `hermes mpm parallelism` can answer "is parallelism working?" — the fraction
+  of tool-emitting turns that batched more than one call — from a durable
+  SELECT/GROUP BY, not a fragile classifier.
 - **CLI** — `hermes mpm list-profiles`, `hermes mpm routing "<msg>"`
-  (dry-run classifier), and `hermes mpm runs` (tracked-run table).
+  (dry-run classifier), `hermes mpm runs` (tracked-run table), and
+  `hermes mpm parallelism` (tool-call batch rate, overall + per-model).
 - **Dashboard panel** (`dashboard/`) — an "MPM Runs" tab for the Hermes
   dashboard that surfaces the same run history in the browser via a
   **read-only** API, so an operator can watch live/finished subagent runs
@@ -147,7 +153,11 @@ caller-supplied subtasks (no LLM decomposition).
 Subagent lifecycle hooks (`subagent_start` / `subagent_stop`, plus a
 `pre_llm_call` fallback that closes async/background runs when their
 completion marker re-enters the turn) write every delegation to a durable
-SQLite DB at `<hermes_home>/mpm_runs.db`. Schema creation happens at plugin
+SQLite DB at `<hermes_home>/mpm_runs.db`. A `post_api_request` hook fires once
+per LLM response (main agent + every subagent) and records that turn's
+assistant tool-call count to the `turn_batches` table — the parallelism signal
+(see [Parallelism telemetry](#parallelism-telemetry)) — folding it into the
+matching subagent run's `max_batch_size` / `turn_count` columns. Schema creation happens at plugin
 load (in every process, so the CLI and dashboard see the current schema). The
 mutating restart-orphan sweep (`running` rows left by a dead process are marked
 `crashed`) and retention purge are **deferred** to a lazy once-per-process pass
@@ -170,11 +180,33 @@ hermes mpm runs --limit 200           # 1-1000, newest first (default 50)
 ```
 
 It prints a fixed-width table (short run id, status, profile/role, age,
-duration, goal). An unparseable `--since` or a `--limit` below 1 is rejected with
-a stderr error and exit code 2, rather than silently dumping an over-broad list.
+duration, BATCH, goal), where BATCH is the run's largest single-turn tool-call
+count (`max_batch_size`; `-` when the run never emitted a tool call) — `>1`
+means the run batched calls in parallel internally. An unparseable `--since` or
+a `--limit` below 1 is rejected with a stderr error and exit code 2, rather than
+silently dumping an over-broad list.
 
 Retention defaults to 30 days; override it with `hermes_mpm.runs.retention_days`
-(see the configuration schema). A non-positive value disables purging.
+(see the configuration schema). It purges both ended runs and old `turn_batches`
+rows past the cutoff. A non-positive value disables purging.
+
+### Parallelism telemetry
+
+`hermes mpm parallelism` answers "is parallelism working?" — the batch rate,
+the fraction of tool-emitting turns that batched more than one tool call,
+overall and per model. It reads the durable per-turn tool-call counts
+(`turn_batches`, written by the `post_api_request` hook) with no LLM:
+
+```bash
+hermes mpm parallelism                 # overall + per-model batch rate
+hermes mpm parallelism --since 24h     # relative window: <int><s|m|h|d>
+hermes mpm parallelism --model <id>    # restrict to a single model id
+```
+
+It prints the overall rate (`multi/tool-turns batched >1`) followed by a
+per-model breakdown. With no tool-call turns recorded yet it prints a notice and
+exits 0; an unparseable `--since` is rejected (stderr, exit 2) and a DB read
+failure is reported (exit 1) rather than crashing.
 
 ### Dashboard panel
 
@@ -207,8 +239,8 @@ src/hermes_mpm/
   intent.py            ported weather/time/disk/svc matchers + handler + commands
   weather_core.py      deterministic Open-Meteo core (vendored)
   cluster_ops_client.py bounded cluster-ops MCP client (vendored)
-  runs_db.py           durable SQLite run-tracking (init/record/sweep/query/purge)
-  cli.py               `hermes mpm` (list-profiles + routing dry-run + runs)
+  runs_db.py           durable SQLite run-tracking + batch telemetry (init/record/sweep/query/purge)
+  cli.py               `hermes mpm` (list-profiles + routing dry-run + runs + parallelism)
   dashboard/           "MPM Runs" dashboard panel
     manifest.json      panel manifest (tab, icon, entry/css/api wiring)
     plugin_api.py      read-only FastAPI router (/api/plugins/mpm-runs/)
@@ -217,6 +249,7 @@ src/hermes_mpm/
   data/profiles.default.yaml
   tests/               test_loads / test_routing / test_orchestrator / test_intent
                        / test_runs_db / test_runs_cli / test_runs_hooks
+                       / test_turn_batches / test_parallelism_cli
                        / test_dashboard_plugin_api
 ```
 
