@@ -561,6 +561,19 @@ _DECOMPOSE_HINT: str = (
     "Max 5 concurrent subtasks; batch if more."
 )
 
+# Compact, leaf-appropriate batching hint injected on subagent/leaf turns.
+# A leaf CANNOT delegate or orchestrate, so this carries NO PM/orchestration
+# framing (unlike _DECOMPOSE_HINT) — it only tells the leaf to parallelize its
+# OWN independent tool calls. Kept as a module constant so tests can assert on
+# it without instantiating the hook. Length target: <80 tokens.
+_LEAF_BATCH_HINT: str = (
+    "[MPM] If your task needs several INDEPENDENT lookups or commands (e.g. "
+    "multiple package/version checks, multiple file reads, multiple searches), "
+    "issue them as PARALLEL tool calls in a SINGLE response rather than one at a "
+    "time. Only serialize when a later call genuinely depends on an earlier "
+    "call's result."
+)
+
 # Always-on AXI cheatsheet — injected into every non-subagent turn as system context.
 # These are lightweight shell CLIs (not MCP servers). Run them via the terminal tool.
 # Target: ~200-300 tokens. Verified invocations only (from --help output).
@@ -599,25 +612,32 @@ def _make_decompose_hint_hook():
     (the only channel available to plugins without breaking the prompt-cache
     prefix). The hint tells the model: batch independent subtasks into one
     hermes_mpm_orchestrate call instead of serializing them.
-    What: Returns a ``pre_llm_call`` callback that always returns
-    ``{"context": _DECOMPOSE_HINT}`` so the engine appends it to the current
-    turn's user message. The hook is a no-op on subagent turns (platform ==
-    "subagent") to avoid leaking PM instructions to child agents.
+    What: Returns a ``pre_llm_call`` callback that returns
+    ``{"context": _DECOMPOSE_HINT}`` on parent/PM turns so the engine appends it
+    to the current turn's user message. On subagent/leaf turns it does NOT leak
+    the PM hint — instead it clears any captured agent and injects the compact
+    ``_LEAF_BATCH_HINT`` (a leaf cannot orchestrate, so it only gets guidance to
+    parallelize its own independent tool calls).
     Test: call hook(platform="cli", user_message="x") → dict with "context" key
     containing "hermes_mpm_orchestrate"; call hook(platform="subagent", ...) →
-    None (no injection on child turns).
+    dict with "context" containing the leaf batch guidance (no orchestration
+    language).
     """
 
     def hint_hook(**kw) -> dict | None:
         platform = (kw.get("platform") or "").lower()
-        # Suppress on subagent turns — children should not receive PM instructions.
-        # Clear any captured agent so a child turn cannot read a stale parent agent.
+        # Subagent/leaf turns: a child cannot delegate or orchestrate, so the
+        # PM-centric _DECOMPOSE_HINT is wrong here. Still clear any captured agent
+        # so a child turn cannot read a stale parent agent. Then inject the
+        # compact leaf-appropriate batching hint so the leaf parallelizes its own
+        # independent tool calls (empirically leaves batch only ~67% of the time
+        # without guidance).
         if platform in ("subagent", "leaf"):
             try:
                 orchestrator.clear_agent()
             except Exception:
                 pass
-            return None
+            return {"context": _LEAF_BATCH_HINT}
         # Suppress on short / referential messages. These are almost always a
         # single action tied to prior conversation context ("lore it", "do it",
         # "yes", "go ahead", "continue"), NOT a multi-part request. Injecting
