@@ -91,6 +91,12 @@ hermes_mpm:
     base_url: "https://openrouter.ai/api/v1"
     api_key_env: OPENROUTER_API_KEY
 
+  # Durable subagent run tracking (the `hermes mpm runs` read surface). Runs land
+  # in <hermes_home>/mpm_runs.db; ended rows older than retention_days are purged
+  # at gateway startup. A non-positive value disables purging (keep all history).
+  runs:
+    retention_days: 30
+
   # Fail-closed, independent code-review GATE for delegate_task. The reviewer is
   # an INDEPENDENT model (different lab from the orchestrator); a same-lab pairing
   # trips the cross-lab guard and blocks all delegate_task. Only the gated tiers
