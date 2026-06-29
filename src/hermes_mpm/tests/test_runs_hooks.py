@@ -38,6 +38,22 @@ def _rows(path):
         conn.close()
 
 
+@pytest.fixture(autouse=True)
+def _reset_startup_maintenance():
+    """Reset the once-per-process startup-maintenance latch between tests.
+
+    Why: ``_startup_maintenance_done`` is module-level state that persists across
+    tests in a process; without resetting it a test that ran maintenance would make
+    every later test's maintenance a no-op, hiding regressions.
+    What: Sets ``_startup_maintenance_done = False`` before and after each test.
+    Test: This fixture's effect is exercised by the maintenance tests below, which
+    assume a fresh (not-done) latch on entry.
+    """
+    hermes_mpm._startup_maintenance_done = False
+    yield
+    hermes_mpm._startup_maintenance_done = False
+
+
 def test_status_mapping_table():
     m = hermes_mpm._map_child_status
     assert m("completed") == runs_db.STATUS_DONE
@@ -228,26 +244,174 @@ def test_register_does_not_sweep_when_not_gateway(db, monkeypatch):
     assert _rows(db)["live"]["status"] == "running"
 
 
-def test_register_sweeps_when_gateway(db, monkeypatch):
-    """Inside the gateway process (_HERMES_GATEWAY=1) the sweep DOES run, reaping
-    prior-process running rows while leaving this process's own rows alone."""
+def test_register_does_not_sweep_even_when_gateway(db, monkeypatch):
+    """register() must NOT sweep at load time even in the gateway process.
+
+    The gateway sets _HERMES_GATEWAY=1 only AFTER plugin register() runs (run.py),
+    so at register() time the flag is unset and a register-time guard would always
+    miss. The sweep is therefore deferred to the first hook-driven turn (see
+    _maybe_run_startup_maintenance). Even if the env IS set when register() runs,
+    register() only init_db()s — it never sweeps."""
     monkeypatch.setenv("_HERMES_GATEWAY", "1")
-    # Prior dead process's run — should be reaped.
+    # Prior dead process's run — would be reaped by a sweep, but register() must
+    # NOT sweep, so it must survive untouched here.
     runs_db._write(
         "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("prior", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
     )
-    # This process's own run — should survive (current pid).
+
+    hermes_mpm.register(_FakeCtx())
+
+    assert _rows(db)["prior"]["status"] == "running"  # register did not sweep
+
+
+def test_maybe_startup_maintenance_sweeps_once_when_gateway(db, monkeypatch):
+    """With _HERMES_GATEWAY=1 and the latch not yet set, the lazy maintenance runs
+    the sweep+purge exactly once: a prior-process running row is reaped, this
+    process's own row survives, and a SECOND call is a no-op (no double sweep)."""
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    # Prior dead process's run — should be reaped by the lazy sweep.
+    runs_db._write(
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        ("prior", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
+    )
+    # This process's own run — must survive (current pid).
     runs_db._write(
         "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("mine", runs_db.STATUS_RUNNING, 1, os.getpid()),
     )
 
-    hermes_mpm.register(_FakeCtx())
+    assert hermes_mpm._startup_maintenance_done is False
+    hermes_mpm._maybe_run_startup_maintenance()
 
     rows = _rows(db)
     assert rows["prior"]["status"] == "crashed"
     assert rows["mine"]["status"] == "running"
+    assert hermes_mpm._startup_maintenance_done is True
+
+    # A second call must be a no-op: re-insert a fresh prior-process orphan and
+    # confirm the latch keeps it from being swept again.
+    runs_db._write(
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        ("prior2", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
+    )
+    hermes_mpm._maybe_run_startup_maintenance()
+    assert _rows(db)["prior2"]["status"] == "running"  # not swept — already done
+
+
+def test_maybe_startup_maintenance_noop_when_not_gateway(db, monkeypatch):
+    """Without _HERMES_GATEWAY the lazy maintenance never sweeps, even called
+    repeatedly — preserving the cross-process safety fix (CLI/dashboard never
+    touch the live gateway's in-flight runs)."""
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    runs_db._write(
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        ("live", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
+    )
+
+    for _ in range(3):
+        hermes_mpm._maybe_run_startup_maintenance()
+
+    assert _rows(db)["live"]["status"] == "running"  # never swept without the env
+    # The latch is NOT consumed in the non-gateway path: it returns before setting
+    # the done flag, so a later gateway turn in the same process could still sweep.
+    assert hermes_mpm._startup_maintenance_done is False
+
+
+def test_maybe_startup_maintenance_swallows_db_error(db, monkeypatch):
+    """A sweep/purge failure inside the lazy maintenance must never raise into the
+    engine, and must still latch done so it doesn't retry-loop every hook."""
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("simulated failure")
+
+    monkeypatch.setattr(runs_db, "sweep_orphaned", boom)
+    hermes_mpm._maybe_run_startup_maintenance()  # must NOT raise
+    assert hermes_mpm._startup_maintenance_done is True  # latched despite failure
+
+
+def test_maybe_startup_maintenance_runs_exactly_once_under_concurrency(db, monkeypatch):
+    """Two threads entering _maybe_run_startup_maintenance simultaneously (env set)
+    must run the sweep EXACTLY once (lock + double-checked latch), never twice."""
+    import threading
+
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    calls: list[int] = []
+
+    def counting_sweep(now, pid):
+        calls.append(1)
+        return 0
+
+    monkeypatch.setattr(runs_db, "sweep_orphaned", counting_sweep)
+    monkeypatch.setattr(runs_db, "purge_old", lambda *a, **k: 0)
+
+    barrier = threading.Barrier(2)
+
+    def worker():
+        barrier.wait()  # maximize the race
+        hermes_mpm._maybe_run_startup_maintenance()
+
+    t1 = threading.Thread(target=worker)
+    t2 = threading.Thread(target=worker)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert len(calls) == 1  # sweep ran exactly once despite the race
+    assert hermes_mpm._startup_maintenance_done is True
+
+
+def test_subagent_start_handler_triggers_maintenance_then_records(db, monkeypatch):
+    """The subagent_start handler runs startup maintenance once (gateway env) at the
+    TOP, then records the run — both effects observable from a single call."""
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    # A prior-process orphan that the top-of-handler maintenance should reap.
+    runs_db._write(
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        ("prior", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
+    )
+
+    handler = hermes_mpm._make_subagent_start_handler()
+    handler(parent_session_id="p1", child_session_id="c1", child_goal="g")
+
+    rows = _rows(db)
+    assert rows["prior"]["status"] == "crashed"  # maintenance fired at the top
+    assert rows["c1"]["status"] == "running"  # then the run was recorded
+    assert hermes_mpm._startup_maintenance_done is True
+
+
+def test_pre_llm_call_async_handler_triggers_maintenance(db, monkeypatch):
+    """The pre_llm_call async-complete handler also runs startup maintenance once
+    at the TOP (whichever hook fires first in the gateway does it). Driving it with
+    a non-marker message still triggers maintenance, then returns None."""
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    runs_db._write(
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        ("prior", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
+    )
+
+    handler = hermes_mpm._make_async_complete_handler()
+    assert handler(user_message="not a marker") is None  # still defers the turn
+
+    assert _rows(db)["prior"]["status"] == "crashed"  # maintenance fired at the top
+    assert hermes_mpm._startup_maintenance_done is True
+
+
+def test_register_does_not_sweep_only_init_db(db, monkeypatch):
+    """CLI/non-gateway register() path: register() must only init_db, never sweep —
+    even with no _HERMES_GATEWAY env. A pre-existing orphan survives load."""
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    runs_db._write(
+        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        ("orphan", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
+    )
+
+    hermes_mpm.register(_FakeCtx())
+
+    assert _rows(db)["orphan"]["status"] == "running"  # register only init_db'd
+    assert hermes_mpm._startup_maintenance_done is False  # register never latches
 
 
 def test_async_complete_handler_parses_duration(db):
