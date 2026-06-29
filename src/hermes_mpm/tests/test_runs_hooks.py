@@ -270,6 +270,11 @@ def test_maybe_startup_maintenance_sweeps_once_when_gateway(db, monkeypatch):
     the sweep+purge exactly once: a prior-process running row is reaped, this
     process's own row survives, and a SECOND call is a no-op (no double sweep)."""
     monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    # Treat the prior owner pid as dead so liveness can't mask the scoping: under
+    # pytest os.getpid()+1 is frequently a live sibling process, which the sweep
+    # (correctly) refuses to reap. Forcing _pid_alive False makes the "prior dead
+    # process" premise deterministic — matching test_runs_db.py's sweep tests.
+    monkeypatch.setattr(runs_db, "_pid_alive", lambda pid: False)
     # Prior dead process's run — should be reaped by the lazy sweep.
     runs_db._write(
         "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
@@ -367,6 +372,9 @@ def test_subagent_start_handler_triggers_maintenance_then_records(db, monkeypatc
     """The subagent_start handler runs startup maintenance once (gateway env) at the
     TOP, then records the run — both effects observable from a single call."""
     monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    # Force the prior owner pid dead (os.getpid()+1 is often a live sibling under
+    # pytest, which the sweep correctly skips) so the reap premise is deterministic.
+    monkeypatch.setattr(runs_db, "_pid_alive", lambda pid: False)
     # A prior-process orphan that the top-of-handler maintenance should reap.
     runs_db._write(
         "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
@@ -387,6 +395,9 @@ def test_pre_llm_call_async_handler_triggers_maintenance(db, monkeypatch):
     at the TOP (whichever hook fires first in the gateway does it). Driving it with
     a non-marker message still triggers maintenance, then returns None."""
     monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    # Force the prior owner pid dead (os.getpid()+1 is often a live sibling under
+    # pytest, which the sweep correctly skips) so the reap premise is deterministic.
+    monkeypatch.setattr(runs_db, "_pid_alive", lambda pid: False)
     runs_db._write(
         "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("prior", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
