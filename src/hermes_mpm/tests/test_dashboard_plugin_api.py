@@ -24,9 +24,7 @@ from hermes_mpm import runs_db
 
 # --- locate + load the plugin module by file path (host-style) -------------
 
-_PLUGIN_API = (
-    Path(runs_db.__file__).resolve().parent / "dashboard" / "plugin_api.py"
-)
+_PLUGIN_API = Path(runs_db.__file__).resolve().parent / "dashboard" / "plugin_api.py"
 
 
 def _load_plugin_api():
@@ -38,9 +36,7 @@ def _load_plugin_api():
     What: Builds an importlib spec from the file and executes it.
     Test: Implicit — every test below depends on this returning the module.
     """
-    spec = importlib.util.spec_from_file_location(
-        "hermes_mpm_dashboard_plugin_api", _PLUGIN_API
-    )
+    spec = importlib.util.spec_from_file_location("hermes_mpm_dashboard_plugin_api", _PLUGIN_API)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

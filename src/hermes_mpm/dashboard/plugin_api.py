@@ -81,6 +81,7 @@ def _reader_connect() -> sqlite3.Connection:
     conn.execute("PRAGMA query_only = ON")
     return conn
 
+
 # Status vocabulary mirrors runs_db; used to give /runs/stats a stable key set
 # even for statuses that currently have zero rows.
 _KNOWN_STATUSES = (
