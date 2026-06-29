@@ -146,18 +146,27 @@ def test_read_config_merges_top_level_and_entry(monkeypatch, tmp_path):
     """_read_config must merge top-level hermes_mpm (routing) over the entry
     block (gate), so routing sees its tiers and the gate keeps review_gate."""
     import yaml as _yaml
+
     home = tmp_path / "home"
     home.mkdir()
-    (home / "config.yaml").write_text(_yaml.safe_dump({
-        "hermes_mpm": {
-            "tiers": {"strong": {"model": "glm-5.2"}, "main": {"model": "glm-4.7"}},
-            "openrouter": {"provider": "zai"},
-        },
-        "plugins": {"entries": {"hermes_mpm": {
-            "review_gate": {"enabled": True},
-            "tiers": {"main": {"model": "old"}},
-        }}},
-    }))
+    (home / "config.yaml").write_text(
+        _yaml.safe_dump(
+            {
+                "hermes_mpm": {
+                    "tiers": {"strong": {"model": "glm-5.2"}, "main": {"model": "glm-4.7"}},
+                    "openrouter": {"provider": "zai"},
+                },
+                "plugins": {
+                    "entries": {
+                        "hermes_mpm": {
+                            "review_gate": {"enabled": True},
+                            "tiers": {"main": {"model": "old"}},
+                        }
+                    }
+                },
+            }
+        )
+    )
     monkeypatch.setenv("HERMES_HOME", str(home))
     cfg = hermes_mpm._read_config(object())
     # Top-level routing tiers win (strong present, main overwritten).
