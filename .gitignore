@@ -6,7 +6,9 @@ __pycache__/
 .Python
 build/
 develop-eggs/
-dist/
+# Anchored to repo root: ignore the setuptools build artifact ./dist/, but keep
+# the hand-written plugin panel at src/hermes_mpm/dashboard/dist/ tracked.
+/dist/
 downloads/
 eggs/
 .eggs/

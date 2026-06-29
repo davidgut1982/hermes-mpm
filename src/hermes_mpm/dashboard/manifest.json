@@ -1,0 +1,14 @@
+{
+  "name": "mpm-runs",
+  "label": "MPM Runs",
+  "description": "Durable subagent run tracking — live status, profile/role, duration and goal for every hermes-mpm delegation across gateway restarts",
+  "icon": "Activity",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/mpm-runs",
+    "position": "after:kanban"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
