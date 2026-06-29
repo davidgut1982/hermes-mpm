@@ -570,8 +570,10 @@ _LEAF_BATCH_HINT: str = (
     "[MPM] If your task needs several INDEPENDENT lookups or commands (e.g. "
     "multiple package/version checks, multiple file reads, multiple searches), "
     "issue them as PARALLEL tool calls in a SINGLE response rather than one at a "
-    "time. Only serialize when a later call genuinely depends on an earlier "
-    "call's result."
+    "time, running each distinct lookup EXACTLY ONCE — do not re-call a tool with "
+    "arguments you have already used, and once you have all the results, stop and "
+    "report rather than repeating calls. Only serialize when a later call "
+    "genuinely depends on an earlier call's result."
 )
 
 # Always-on AXI cheatsheet — injected into every non-subagent turn as system context.

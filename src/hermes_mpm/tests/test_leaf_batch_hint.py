@@ -31,8 +31,11 @@ def test_leaf_turn_injects_batch_hint(platform):
     out = hook(platform=platform, user_message="check versions of foo, bar, baz")
     assert out is not None
     assert out["context"] == hermes_mpm._LEAF_BATCH_HINT
-    # Distinctive substring of the leaf guidance.
+    # Distinctive substring of the parallel-batching guidance (v1, retained).
     assert "PARALLEL tool calls in a SINGLE response" in out["context"]
+    # Distinctive substring of the v2 anti-redundancy guidance.
+    assert "EXACTLY ONCE" in out["context"]
+    assert "already used" in out["context"]
     # A leaf cannot delegate/orchestrate — the PM framing must NOT leak in.
     assert "hermes_mpm_orchestrate" not in out["context"]
     assert "orchestrate" not in out["context"].lower()
