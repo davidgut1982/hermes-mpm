@@ -1,0 +1,14 @@
+/* MPM Runs plugin styles.
+ *
+ * Intentionally minimal: the host dashboard ships Tailwind + the Nous design
+ * system, and the plugin renders with inline styles that read host CSS vars
+ * (--border, --card, --accent, --destructive). Only a couple of affordances
+ * that inline styles can't express cleanly (hover) live here. */
+
+.mpm-runs-page table tbody tr:hover {
+  background: var(--muted, rgba(127, 127, 127, 0.08));
+}
+
+.mpm-chip:hover {
+  filter: brightness(1.1);
+}

@@ -18,7 +18,14 @@ hermes_mpm = "hermes_mpm"
 where = ["src"]
 
 [tool.setuptools.package-data]
-hermes_mpm = ["plugin.yaml", "data/*.yaml", "skills/**/*.md"]
+hermes_mpm = [
+    "plugin.yaml",
+    "data/*.yaml",
+    "skills/**/*.md",
+    "dashboard/manifest.json",
+    "dashboard/plugin_api.py",
+    "dashboard/dist/*",
+]
 
 [tool.ruff]
 line-length = 100
