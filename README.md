@@ -143,11 +143,17 @@ caller-supplied subtasks (no LLM decomposition).
 Subagent lifecycle hooks (`subagent_start` / `subagent_stop`, plus a
 `pre_llm_call` fallback that closes async/background runs when their
 completion marker re-enters the turn) write every delegation to a durable
-SQLite DB at `<hermes_home>/mpm_runs.db`. Schema creation, restart-orphan
-sweeping (`running` rows left by a dead process are marked `crashed`), and
-retention purging happen at plugin load — the mutating sweep/purge run **only**
-in the gateway process (gated on `_HERMES_GATEWAY=1`) so the CLI and dashboard
-never corrupt live runs.
+SQLite DB at `<hermes_home>/mpm_runs.db`. Schema creation happens at plugin
+load (in every process, so the CLI and dashboard see the current schema). The
+mutating restart-orphan sweep (`running` rows left by a dead process are marked
+`crashed`) and retention purge are **deferred** to a lazy once-per-process pass
+fired from the **first gateway hook** — not at plugin load, because `register()`
+runs before the gateway sets `_HERMES_GATEWAY=1`, so a load-time guard would
+always miss and the sweep would never fire. Run by hook, the env is set by then;
+the pass is gated on `_HERMES_GATEWAY=1` at runtime and latched to run exactly
+once, so the gateway sweeps once and the CLI and dashboard (which never set the
+env) never sweep — preserving the cross-process fix that keeps them from
+corrupting live runs.
 
 Inspect runs with the no-LLM CLI:
 

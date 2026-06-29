@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -31,6 +32,20 @@ CONFIG_NAMESPACE = "hermes_mpm"
 # Default run-retention when ``plugins.entries.hermes_mpm.runs.retention_days``
 # is unset. 30 days keeps recent history queryable without unbounded growth.
 DEFAULT_RETENTION_DAYS = 30
+
+# Retention captured at register() time so the LAZY startup-maintenance path
+# (which fires from a hook, after register has returned) has the operator's value
+# without re-reading config on a hot hook. Defaults until register() resolves it.
+_RUNS_RETENTION_DAYS = DEFAULT_RETENTION_DAYS
+
+# Once-per-process latch for the startup crash-sweep + retention purge. The
+# gateway sets _HERMES_GATEWAY=1 only AFTER plugin register() runs (run.py), so a
+# register-time guard always misses and the sweep never fires. Instead we run it
+# LAZILY from the first hook of the gateway turn, exactly once, guarded by this
+# flag + lock (double-checked). CLI/dashboard never set the env, so they never
+# sweep — preserving the cross-process data-corruption fix.
+_startup_maintenance_done = False
+_startup_maintenance_lock = threading.Lock()
 
 # Maps the engine's child_status vocabulary (from the subagent_stop hook and the
 # async-complete marker) onto our terminal run statuses. Anything finished but
@@ -110,6 +125,13 @@ def _make_subagent_start_handler():
     """
 
     def handler(**kw) -> None:
+        # Lazy once-per-process startup sweep+purge (gateway only). Whichever hook
+        # fires first in the gateway turn runs it; the latch no-ops the rest. Never
+        # raises (the function swallows internally) — defensive belt below too.
+        try:
+            _maybe_run_startup_maintenance()
+        except Exception:  # never break a delegation
+            pass
         try:
             run_id = kw.get("child_session_id")
             if not run_id:
@@ -178,6 +200,13 @@ def _make_async_complete_handler():
     """
 
     def handler(**kw):
+        # Lazy once-per-process startup sweep+purge (gateway only). pre_llm_call
+        # fires on every turn, so if subagent_start hasn't run yet this closes the
+        # window. The latch no-ops once done. Never raises into the engine.
+        try:
+            _maybe_run_startup_maintenance()
+        except Exception:
+            pass
         try:
             msg = (kw.get("user_message") or "").lstrip()
             if not msg.startswith(_ASYNC_MARKER_PREFIX):
@@ -345,6 +374,50 @@ def _runs_retention_days(cfg: dict) -> int:
     except (TypeError, ValueError):
         pass
     return DEFAULT_RETENTION_DAYS
+
+
+def _maybe_run_startup_maintenance() -> None:
+    """Run the gateway startup crash-sweep + retention purge exactly once, lazily.
+
+    Why: register() runs in EVERY process (gateway, ``hermes mpm runs`` CLI,
+    dashboard) BEFORE the gateway sets _HERMES_GATEWAY=1 (run.py sets it after
+    plugins load), so a register-time env guard always misses and the durability
+    sweep never fires. Deferring it to the first hook of a real turn lets the env
+    be set by then; the latch makes every later hook a no-op. CLI/dashboard never
+    set the env, so they never sweep — preserving the cross-process fix that stops
+    them from marking the live gateway's in-flight runs ``crashed``.
+    What: Fast-returns if already done. Returns without sweeping when
+    _HERMES_GATEWAY != "1". Otherwise takes the lock, re-checks the latch
+    (double-checked locking), runs sweep_orphaned + purge_old, logs the counts at
+    INFO, swallows any error, and latches done in a ``finally`` so a failure never
+    retry-loops on every hook.
+    Test: ``test_maybe_startup_maintenance_*`` in test_runs_hooks.py — gateway runs
+    once (second call no-op), non-gateway never sweeps, DB error is swallowed +
+    latched, and two concurrent threads sweep EXACTLY once.
+    """
+    global _startup_maintenance_done
+    if _startup_maintenance_done:
+        return
+    # CLI/dashboard never sweep — only the gateway (which sets this at runtime) may.
+    if os.environ.get("_HERMES_GATEWAY") != "1":
+        return
+    with _startup_maintenance_lock:
+        if _startup_maintenance_done:  # double-checked: another thread won the race
+            return
+        try:
+            now = int(time.time())
+            orphaned = runs_db.sweep_orphaned(now, os.getpid())
+            purged = runs_db.purge_old(_RUNS_RETENTION_DAYS, now)
+            logger.info(
+                "mpm-runs: startup maintenance — %d orphaned marked crashed, %d purged",
+                orphaned,
+                purged,
+            )
+        except Exception as exc:  # never raise into the engine from a hook
+            logger.warning("mpm-runs: startup maintenance failed (ignored): %s", exc)
+        finally:
+            # Latch even on failure so a broken DB doesn't retry-sweep every hook.
+            _startup_maintenance_done = True
 
 
 def _make_pre_llm_call(cfg: dict):
@@ -555,34 +628,25 @@ def register(ctx) -> None:
     except Exception as exc:
         logger.debug("hermes-mpm: ctx capture for orchestrator skipped: %s", exc)
 
-    # 0) Run-tracking DB — startup lifecycle: init schema, then (GATEWAY ONLY)
-    #    sweep restart-orphaned runs + purge old ended rows. DDL runs ONLY here
-    #    (init_db), never on a hot hook path.
+    # 0) Run-tracking DB — init schema here (idempotent, additive ALTER) so EVERY
+    #    process that loads the plugin (gateway, `hermes mpm runs` CLI, dashboard)
+    #    sees the current schema. DDL runs ONLY here, never on a hot hook path.
     #
-    #    CRITICAL: register() runs in EVERY process that loads the plugin — the
-    #    gateway, but ALSO `hermes mpm runs` and the dashboard. The sweep/purge
-    #    are MUTATING; running them outside the gateway corrupted data (the CLI or
-    #    dashboard would mark the live gateway's in-flight runs ``crashed`` and
-    #    make async runs permanently un-closable). So we gate them behind
-    #    _HERMES_GATEWAY=1 — the env the gateway process sets (gateway/run.py) and
-    #    explicitly strips from its watcher/children. init_db (idempotent, additive
-    #    ALTER) is safe everywhere and still runs so the CLI sees current schema.
-    #    All best-effort: a tracking-DB failure must degrade hooks to no-ops, never
-    #    block plugin load.
+    #    The crash-sweep + retention purge are DEFERRED to a lazy once-per-process
+    #    pass (_maybe_run_startup_maintenance) fired from the first gateway hook —
+    #    NOT run here. CRITICAL: register() runs BEFORE the gateway sets
+    #    _HERMES_GATEWAY=1 (gateway/run.py sets it after plugins load), so a
+    #    register-time env guard would ALWAYS miss and the sweep would never fire
+    #    (verified live: "non-gateway process — sweep/purge skipped" on startup).
+    #    Running by hook instead means the env is set by then. CLI/dashboard never
+    #    set the env, so they still never sweep — the cross-process data-corruption
+    #    fix is preserved. We only capture retention_days here so the lazy path has
+    #    it without re-reading config on a hook.
+    global _RUNS_RETENTION_DAYS
+    _RUNS_RETENTION_DAYS = _runs_retention_days(cfg)
     try:
         runs_db.init_db()
-        if os.environ.get("_HERMES_GATEWAY") == "1":
-            now = int(time.time())
-            orphaned = runs_db.sweep_orphaned(now, os.getpid())
-            retention_days = _runs_retention_days(cfg)
-            purged = runs_db.purge_old(retention_days, now)
-            logger.info(
-                "mpm-runs: db ready, %d orphaned run(s) marked crashed, %d old run(s) purged",
-                orphaned,
-                purged,
-            )
-        else:
-            logger.debug("mpm-runs: db ready (non-gateway process — sweep/purge skipped)")
+        logger.debug("mpm-runs: db ready (schema initialized; sweep deferred to first hook)")
     except Exception as exc:
         logger.warning("hermes-mpm: run-tracking DB init skipped: %s", exc)
 
