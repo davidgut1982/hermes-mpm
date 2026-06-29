@@ -86,3 +86,66 @@ def test_runs_since_filter_parses_duration(db, capsys):
     assert rc == 0
     rc = _run(["runs", "--since", "7d"])
     assert rc == 0
+
+
+def test_runs_since_parses_to_correct_cutoff(db, monkeypatch):
+    """Why: a valid --since must filter on now-delta, not silently no-op.
+    What: --since 30m/24h/7d resolve to time.time()-{1800,86400,604800}.
+    Test: freeze time.time(), capture the since= passed to query_runs.
+    """
+    captured = {}
+
+    def fake_query_runs(*, status, session, since, limit):
+        captured["since"] = since
+        captured["limit"] = limit
+        return []
+
+    monkeypatch.setattr(cli.time, "time", lambda: 1_000_000)
+    monkeypatch.setattr(runs_db, "query_runs", fake_query_runs)
+
+    for window, delta in (("30m", 1800), ("24h", 86400), ("7d", 604800)):
+        assert _run(["runs", "--since", window]) == 0
+        assert captured["since"] == 1_000_000 - delta
+
+
+@pytest.mark.parametrize("bad", ["5x", "1hh", "24", "abc", "h"])
+def test_runs_since_unparseable_errors(db, bad, capsys):
+    """Why: an unparseable/unit-less --since must error loudly, never dump unfiltered.
+    What: bad --since -> message on stderr mentioning --since + non-zero exit; no table.
+    Test: parametrized over 5x, 1hh, bare 24, abc, lone unit, negative.
+    """
+    # Make a row exist so a silent no-filter fall-through would print it.
+    runs_db.record_start("sentinel-sess", "p", "r", None, "SENTINELGOAL", 1, "subagent")
+
+    rc = _run(["runs", "--since", bad])
+    cap = capsys.readouterr()
+    assert rc != 0
+    assert "--since" in cap.err
+    assert "SENTINELGOAL" not in cap.out  # did NOT fall through to an unfiltered dump
+
+
+def test_runs_limit_zero_errors(db, capsys):
+    """Why: --limit 0 must not silently become 50; --limit -1 must not mean unlimited.
+    What: limit < 1 -> clear stderr message + non-zero exit, no table printed.
+    Test: --limit 0 and --limit -5.
+    """
+    runs_db.record_start("sentinel-sess", "p", "r", None, "SENTINELGOAL", 1, "subagent")
+
+    for bad in ("0", "-5"):
+        rc = _run(["runs", "--limit", bad])
+        cap = capsys.readouterr()
+        assert rc != 0
+        assert "--limit" in cap.err
+        assert "SENTINELGOAL" not in cap.out
+
+
+def test_runs_limit_valid_works(db, capsys):
+    """Why: regression guard that a normal positive --limit still lists rows.
+    What: --limit 5 returns 0 and prints the row.
+    Test: one recorded run, --limit 5.
+    """
+    runs_db.record_start("vis-sess", "p", "r", None, "VISIBLEGOAL", 1, "subagent")
+    rc = _run(["runs", "--limit", "5"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "VISIBLEGOAL" in out

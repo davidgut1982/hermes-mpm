@@ -14,6 +14,7 @@ config summary and returns 0 (OK/DISABLED) or non-zero (WARN/misconfigured).
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 
 from . import profiles, routing
@@ -76,13 +77,13 @@ def setup(parser: argparse.ArgumentParser) -> None:
     runs_p.add_argument(
         "--since",
         default=None,
-        help="Only runs started within this window, e.g. 1h, 24h, 7d.",
+        help="Only runs started within this window; <int><s|m|h|d>, e.g. 30m, 24h, 7d.",
     )
     runs_p.add_argument(
         "--limit",
         type=int,
         default=50,
-        help="Max rows to show (newest first). Default: 50.",
+        help="Max rows to show (newest first), 1-1000. Default: 50.",
     )
 
     # Default action when `hermes mpm` is called bare.
@@ -113,26 +114,38 @@ def handle(args: argparse.Namespace) -> int:
 
 
 def _parse_since(since: str | None) -> int | None:
-    """Convert a ``1h``/``24h``/``7d``/``30m`` window into an epoch cutoff.
+    """Convert a ``30m``/``1h``/``24h``/``7d`` window into an epoch cutoff.
 
     Why: Operators think in relative windows ("runs in the last 24h"), not epoch
-    seconds; this maps the shorthand to ``now - delta`` for query_runs(since=).
-    What: Parses ``<int><s|m|h|d>`` (or a bare int = seconds) and returns the
-    epoch cutoff, or None when ``since`` is empty/unparseable (no filter).
-    Test: ``test_runs_since_filter_parses_duration`` exercises 24h and 7d.
+    seconds; this maps the shorthand to ``now - delta`` for query_runs(since=). A
+    non-empty value that we cannot parse must NOT silently mean "no filter" — that
+    would dump the full list and mislead the operator — so it raises instead.
+    What: Empty/None -> None (no filter). A valid ``<positive-int><s|m|h|d>`` ->
+    the epoch cutoff. Anything else (bad unit, unit-less bare int like ``24``,
+    junk) raises ValueError with a fix-it message.
+    Test: ``test_runs_since_parses_to_correct_cutoff`` (cutoffs) +
+    ``test_runs_since_unparseable_errors`` (5x/1hh/bare 24/abc/h raise).
     """
     if not since:
         return None
     units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
     raw = since.strip().lower()
+    unit = raw[-1:] if raw else ""
+    if unit not in units:
+        raise ValueError(
+            f"invalid --since {since!r}; use forms like 30m, 24h, 7d "
+            "(an integer followed by s/m/h/d)"
+        )
     try:
-        if raw[-1] in units:
-            delta = int(raw[:-1]) * units[raw[-1]]
-        else:
-            delta = int(raw)
-    except (ValueError, IndexError):
-        return None
-    return int(time.time()) - delta
+        amount = int(raw[:-1])
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid --since {since!r}; use forms like 30m, 24h, 7d "
+            "(an integer followed by s/m/h/d)"
+        ) from exc
+    if amount <= 0:
+        raise ValueError(f"invalid --since {since!r}; the value must be a positive integer")
+    return int(time.time()) - amount * units[unit]
 
 
 def _fmt_age(seconds: float) -> str:
@@ -160,15 +173,30 @@ def _runs(args: argparse.Namespace) -> int:
     is running / crashed" across restarts without touching the gateway.
     What: Queries runs_db.query_runs with the parsed filters and prints a fixed
     -width table (short run id, status, profile/role, age, duration, goal). Prints
-    a clean notice and returns 0 when there are no matching runs.
-    Test: ``test_runs_empty`` + ``test_runs_formats_rows`` + ``test_runs_status_filter``.
+    a clean notice and returns 0 when there are no matching runs. Rejects an
+    unparseable ``--since`` or a ``--limit`` < 1 with a stderr error + exit 2,
+    rather than silently dumping an unfiltered/over-broad list.
+    Test: ``test_runs_empty`` + ``test_runs_formats_rows`` + ``test_runs_status_filter``
+    + ``test_runs_since_unparseable_errors`` + ``test_runs_limit_zero_errors``.
     """
     from . import runs_db
 
     status = getattr(args, "status", None)
     session = getattr(args, "session", None)
-    since = _parse_since(getattr(args, "since", None))
-    limit = getattr(args, "limit", 50) or 50
+    try:
+        since = _parse_since(getattr(args, "since", None))
+    except ValueError as exc:
+        print(f"runs: {exc}", file=sys.stderr)
+        return 2
+
+    limit = getattr(args, "limit", 50)
+    if limit is None or limit < 1:
+        print(
+            f"runs: invalid --limit {limit!r}; must be a positive integer (1-1000)",
+            file=sys.stderr,
+        )
+        return 2
+    limit = min(limit, 1000)
 
     try:
         rows = runs_db.query_runs(status=status, session=session, since=since, limit=limit)
