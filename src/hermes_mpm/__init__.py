@@ -581,7 +581,11 @@ _LEAF_BATCH_HINT: str = (
 # Target: ~200-300 tokens. Verified invocations only (from --help output).
 _AXI_CHEATSHEET: str = (
     "[AXI TOOLS — run via terminal/shell, NOT MCP]\n"
-    "These replace the heavy MCP servers. Use them for all web search and KB ops.\n\n"
+    "These replace the heavy MCP servers. Use them for all web search and KB ops.\n"
+    "ORIENT BEFORE ACTING: if unsure of a command's flags, run `<tool> --help` or "
+    "`<tool> <subcommand> --help` FIRST. Never retry the same command with permuted "
+    "flag syntax — read the help instead. A permission/authorization error (403) is "
+    "NOT fixed by retrying; stop.\n\n"
     "WEB SEARCH (for current info, news, URLs — always use these, not training data):\n"
     '  tavily-axi search "<query>" [--limit N] [--depth basic|advanced] [--include-answer]\n'
     '  exa-axi search "<query>" [--limit N] [--type auto|text|url]\n'
@@ -590,8 +594,14 @@ _AXI_CHEATSHEET: str = (
     '  lore-axi kb-search "<query>" [--hybrid] [--limit 20]\n'
     "  lore-axi kb-add <topic> <title> <content>\n"
     "  lore-axi kb-get <id>\n\n"
-    "GITHUB:\n"
-    "  gh-axi issue list / pr list / repo ...\n\n"
+    "GITHUB (flag -R/--repo <owner/name> goes AFTER the command; space or = form):\n"
+    "  gh-axi pr view 42 -R owner/name   # also: --repo=owner/name\n"
+    "  gh-axi pr <list|view|create|edit|close|merge|comment|review|diff|reopen|ready> [n]\n"
+    "  gh-axi issue list / repo ...\n"
+    '  pr close has NO --comment flag: gh-axi pr comment <n> --body "..." then pr close <n>\n'
+    "  Before a MUTATING action (close/merge/edit/delete) confirm write/triage on the repo "
+    "(you own davidgut1982/* forks; NousResearch/* is read-only upstream). A 403 / "
+    '"does not have the correct permissions" is non-retryable.\n\n'
     "CLUSTER OPS (read-only status):\n"
     "  cluster-ops-axi dashboard\n"
     "  cluster-ops-axi service <host> <unit>\n"
@@ -688,7 +698,8 @@ def _make_axi_cheatsheet_hook():
     for parent/PM turns. Suppressed on subagent/leaf turns (children receive a
     scoped subset via their task context instead).
     Test: call hook(platform="cli") -> dict with "context" key containing
-    "tavily-axi"; call hook(platform="subagent") -> None.
+    "tavily-axi" and the gh-axi guidance ("-R" placement, "pr comment", the 403
+    non-retryable note); call hook(platform="subagent") -> None.
     """
 
     def axi_hook(**kw) -> dict | None:

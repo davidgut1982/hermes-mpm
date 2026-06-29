@@ -251,6 +251,7 @@ src/hermes_mpm/
                        / test_gate / test_runs_db / test_runs_cli / test_runs_hooks
                        / test_turn_batches / test_parallelism_cli
                        / test_dashboard_plugin_api / test_leaf_batch_hint
+                       / test_axi_cheatsheet
 ```
 
 > Note: `system_prompt_file` paths in the shipped profiles point at
