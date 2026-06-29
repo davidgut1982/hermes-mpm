@@ -229,9 +229,7 @@ def _runs(args: argparse.Namespace) -> int:
         return 0
 
     now = time.time()
-    header = (
-        f"{'RUN':<10} {'STATUS':<9} {'PROFILE':<12} {'AGE':>5} {'DUR':>7} {'BATCH':>5}  GOAL"
-    )
+    header = f"{'RUN':<10} {'STATUS':<9} {'PROFILE':<12} {'AGE':>5} {'DUR':>7} {'BATCH':>5}  GOAL"
     print(header)
     print("-" * len(header))
     for r in rows:
