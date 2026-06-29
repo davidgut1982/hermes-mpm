@@ -248,9 +248,9 @@ src/hermes_mpm/
   skills/pm_orchestrator/SKILL.md
   data/profiles.default.yaml
   tests/               test_loads / test_routing / test_orchestrator / test_intent
-                       / test_runs_db / test_runs_cli / test_runs_hooks
+                       / test_gate / test_runs_db / test_runs_cli / test_runs_hooks
                        / test_turn_batches / test_parallelism_cli
-                       / test_dashboard_plugin_api
+                       / test_dashboard_plugin_api / test_leaf_batch_hint
 ```
 
 > Note: `system_prompt_file` paths in the shipped profiles point at
