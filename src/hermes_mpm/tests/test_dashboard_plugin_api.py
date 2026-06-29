@@ -164,6 +164,103 @@ def test_get_runs_stats_aggregates(client):
     assert body["total"] == 4
 
 
+# --- write-free reader contract: no journal_mode pragma, no disk write ------
+
+
+def test_reader_does_not_write_db(client, monkeypatch):
+    """/runs and /runs/stats must not write the DB file or issue journal_mode.
+
+    Why: The finding ``journal-mode-write-on-read-path`` — the old code reached
+    the DB via ``runs_db._connect`` → ``_apply_wal_with_fallback``, which can
+    issue ``PRAGMA journal_mode=WAL|DELETE`` (a WRITE) from this read-only
+    dashboard process. The reader must be genuinely write-free.
+    What: Spies ``runs_db._apply_wal_with_fallback`` to prove it is never called,
+    records the DB file's mtime+size before the calls, hits both routes, and
+    asserts the file's mtime+size are unchanged and the WAL helper saw zero calls.
+    Test: This test.
+    """
+    calls = {"wal": 0}
+
+    def _spy_wal(*a, **k):
+        calls["wal"] += 1
+
+    monkeypatch.setattr(runs_db, "_apply_wal_with_fallback", _spy_wal)
+
+    db_path = runs_db._db_path()
+    before = db_path.stat()
+
+    assert client.get("/api/plugins/mpm-runs/runs").status_code == 200
+    assert client.get("/api/plugins/mpm-runs/runs/stats").status_code == 200
+
+    after = db_path.stat()
+    # No journal_mode pragma was ever issued from the read path.
+    assert calls["wal"] == 0
+    # The DB file itself was not mutated by the reader.
+    assert (after.st_mtime_ns, after.st_size) == (before.st_mtime_ns, before.st_size)
+
+
+def test_reader_reads_live_wal_db(client):
+    """The write-free reader reads rows from a live WAL-mode DB.
+
+    Why: ``query_only=ON`` (no journal_mode pragma) must still read a DB the
+    gateway opened in WAL mode — the production case on ext4. This proves the
+    reader is not just write-free but actually functional against a live WAL DB.
+    What: Forces the fixture DB into WAL mode via the real write path, seeds a
+    row, then asserts /runs reads it back through the write-free reader.
+    Test: This test.
+    """
+    # The gateway's _connect puts the DB into WAL mode; do the same here so the
+    # reader is exercised against a genuine WAL-mode file.
+    conn = runs_db._connect()
+    try:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        conn.close()
+    assert mode.lower() == "wal"  # confirms a live WAL DB on this FS
+
+    _seed("r-wal", runs_db.STATUS_RUNNING, 3000, profile="engineer", goal="wal read")
+
+    resp = client.get("/api/plugins/mpm-runs/runs")
+    assert resp.status_code == 200
+    assert [r["run_id"] for r in resp.json()["runs"]] == ["r-wal"]
+
+
+def test_routes_degrade_on_malformed_db(tmp_path, monkeypatch):
+    """A malformed/corrupt DB degrades to empty (sqlite3.Error caught), no 500.
+
+    Why: The ``narrow-sqlite-except`` finding — catching only OperationalError
+    let a malformed/corrupt DB surface as a 500. Broadening to ``sqlite3.Error``
+    (which covers DatabaseError "file is not a database") makes the panel degrade
+    to an empty/clean response instead.
+    What: Writes garbage bytes to the DB path (a non-SQLite file that still
+    "exists"), loads the plugin, and asserts both routes return 200-with-empty
+    rather than raising, and that no new file is created.
+    Test: This test.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    bad = tmp_path / "mpm_runs.db"
+    bad.write_bytes(b"this is definitely not a sqlite database header\x00\x01\x02")
+    monkeypatch.setattr(runs_db, "_db_path", lambda: bad)
+
+    module = _load_plugin_api()
+    app = FastAPI()
+    app.include_router(module.router, prefix="/api/plugins/mpm-runs")
+    tc = TestClient(app)
+
+    runs_resp = tc.get("/api/plugins/mpm-runs/runs")
+    assert runs_resp.status_code == 200
+    assert runs_resp.json()["runs"] == []
+
+    stats_resp = tc.get("/api/plugins/mpm-runs/runs/stats")
+    assert stats_resp.status_code == 200
+    assert stats_resp.json()["total"] == 0
+    # No -wal/-shm sidecars created by the reader (query_only never writes).
+    assert not (tmp_path / "mpm_runs.db-wal").exists()
+    assert not (tmp_path / "mpm_runs.db-shm").exists()
+
+
 # --- read-only contract: NO sweep / init / write ---------------------------
 
 
