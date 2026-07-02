@@ -6,24 +6,32 @@ parent has moved on, there is no durable record of what ran, how long, and how
 it ended. This module is the spine of that observability: every subagent start
 and stop is written to ``<hermes_home>/mpm_runs.db`` so ``hermes mpm runs`` can
 answer "what ran / is running / crashed" across restarts. The durability fill is
-``sweep_orphaned`` at startup: any run left ``running`` by a prior process is
-marked ``crashed`` instead of lingering forever.
+``sweep_orphaned`` at startup: any run left ``running`` by a prior (dead) process
+is marked ``crashed`` instead of lingering forever. A parallel ``turn_batches``
+table records the per-turn assistant tool-call count for BOTH the main agent and
+every subagent so ``hermes mpm parallelism`` can report a trustworthy batch rate.
 
 What: A self-contained SQLite layer (no hermes_cli internals imported — the
 connection pattern is *replicated* from kanban_db/hermes_state to avoid version
 coupling) exposing ``init_db``, ``record_start``, ``record_end``,
-``sweep_orphaned``, ``query_runs``, and ``purge_old``. DDL runs only in
-``init_db`` (never on a hot path — concurrent DDL is what corrupted the kanban
-DB historically). Writes use ``BEGIN IMMEDIATE`` with app-level
-retry-with-jitter on transient "database is locked".
+``record_batch_telemetry``, ``sweep_orphaned``, ``query_runs``, ``purge_old``,
+the delegation-correlation helpers (``find_running_by_delegation``,
+``find_running_by_goal``, ``stamp_delegation_id``), and the turn-batch telemetry
+functions (``record_turn_batch``, ``batch_stats``, ``record_run_turn``,
+``purge_old_turn_batches``). DDL runs only in ``init_db`` (never on a hot path —
+concurrent DDL is what corrupted the kanban DB historically). Writes use
+``BEGIN IMMEDIATE`` with app-level retry-with-jitter on transient "database is
+locked". The primary run table is named ``runs``.
 
-Test: ``pytest src/hermes_mpm/tests/test_runs_db.py`` — covers create/close,
-orphan-sweep, filtered query, purge, idempotent re-init, and concurrent writers.
+Test: ``pytest src/hermes_mpm/tests/test_runs_db.py`` +
+``test_turn_batches.py`` — covers create/close, orphan-sweep (pid-liveness
+scoped), delegation correlation + ambiguity guard, filtered query, purge,
+batch telemetry insert/aggregate/fold/purge, idempotent re-init, and concurrent
+writers.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import random
@@ -34,62 +42,80 @@ from typing import Any, Optional
 
 logger = logging.getLogger("hermes_mpm.runs_db")
 
+# SQLite busy timeout — 5s matches the engine's timeout. Concurrent writes
+# (common: subagent_start + subagent_stop from different hooks in the same turn)
+# will wait; if the busy is exhausted the write fails closed.
+_BUSY_TIMEOUT_MS = 5000
+
+# Run-DB filename — always lands under get_hermes_home() so CLI/gateway agree.
 DB_FILENAME = "mpm_runs.db"
 
-# Lock-wait tuning. busy_timeout lets SQLite serialize writers in C; the
-# app-level retry below is a second belt for the rare case the C-level wait
-# still surfaces "database is locked" under a write burst.
-_BUSY_TIMEOUT_MS = 5000
-_MAX_WRITE_RETRIES = 12
-_RETRY_MIN_MS = 20
-_RETRY_MAX_MS = 150
-
-# Filesystems where ``PRAGMA journal_mode=WAL`` fails (NFS/SMB/some FUSE). On
-# these we fall back to DELETE. Markers mirror hermes_state._WAL_INCOMPAT_MARKERS.
-_WAL_INCOMPAT_MARKERS = ("locking protocol", "disk i/o error", "not supported")
-
-# Run statuses we write. Vocabulary mirrors kanban.task_runs.
+# --- shared status vocabulary ----------------------------------------------
+# These are the terminal/running status strings the ``runs`` table stores. They
+# are legitimate shared API: the hook layer (__init__.py) maps the engine's
+# child_status onto them and the dashboard uses them to zero-fill its stat chips,
+# so callers and the schema agree on ONE set of values. Kept as module-level
+# constants (string subclass values) rather than magic strings.
 STATUS_RUNNING = "running"
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
 STATUS_CRASHED = "crashed"
 STATUS_TIMED_OUT = "timed_out"
 
+# Marker written into ``error`` when the orphan sweep reaps a run left running by
+# a prior dead process — surfaced by the CLI/dashboard so the crash is explained.
 _ORPHAN_ERROR = "orphaned by restart"
 
-# DDL — created once in init_db(). Epoch INTEGER timestamps throughout.
-_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS subagent_runs (
-    run_id            TEXT PRIMARY KEY,
+# Table-creation DDL — idempotent, columns only (no indexes: a legacy table
+# migrated by RENAME may lack the new columns, so indexes are created AFTER
+# _ensure_columns fills them in — see init_db).
+_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS runs (
+    run_id TEXT PRIMARY KEY,
     parent_session_id TEXT,
-    role              TEXT,
-    profile           TEXT,
-    goal              TEXT,
-    status            TEXT NOT NULL,
-    started_at        INTEGER NOT NULL,
-    ended_at          INTEGER,
-    duration_ms       INTEGER,
-    summary           TEXT,
-    error             TEXT,
-    delegation_id     TEXT,
-    run_type          TEXT,
-    metadata          TEXT,
-    owner_pid         INTEGER,
-    max_batch_size    INTEGER,
-    turn_count        INTEGER
+    role TEXT,
+    profile TEXT,
+    goal TEXT,
+    status TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    duration_ms INTEGER,
+    summary TEXT,
+    error TEXT,
+    delegation_id TEXT,
+    run_type TEXT,
+    metadata TEXT,
+    owner_pid INTEGER,
+    batch_count INTEGER,
+    max_batch_size INTEGER,
+    turn_count INTEGER,
+    created_at INTEGER DEFAULT (strftime('%s', 'now'))
 );
-CREATE INDEX IF NOT EXISTS idx_runs_status  ON subagent_runs(status);
-CREATE INDEX IF NOT EXISTS idx_runs_parent  ON subagent_runs(parent_session_id);
-CREATE INDEX IF NOT EXISTS idx_runs_started ON subagent_runs(started_at);
 
+-- Per-turn assistant tool-call count (the parallelism signal), one row per LLM
+-- turn that emitted >=1 tool call, for BOTH the main agent and every subagent.
+-- The main agent has no ``runs`` row, so this separate store is what lets
+-- ``batch_stats`` compute a GLOBAL batch rate (folding into ``runs`` alone would
+-- lose main-agent turns). Keyed by api_request_id (first write wins).
 CREATE TABLE IF NOT EXISTS turn_batches (
-    api_request_id  TEXT PRIMARY KEY,
-    turn_id         TEXT,
-    session_id      TEXT,
-    model           TEXT,
+    api_request_id TEXT PRIMARY KEY,
+    turn_id TEXT,
+    session_id TEXT,
+    model TEXT,
     tool_call_count INTEGER NOT NULL,
-    ts              INTEGER NOT NULL
+    ts INTEGER NOT NULL
 );
+"""
+
+# Index DDL — created only AFTER columns are guaranteed present (post-migration),
+# so an index on a newly-ALTER-added column (e.g. owner_pid on a migrated legacy
+# table) never fails with "no such column".
+_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_runs_status  ON runs(status);
+CREATE INDEX IF NOT EXISTS idx_runs_parent  ON runs(parent_session_id);
+CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
+CREATE INDEX IF NOT EXISTS idx_runs_deleg   ON runs(delegation_id);
+CREATE INDEX IF NOT EXISTS idx_runs_owner   ON runs(owner_pid);
 CREATE INDEX IF NOT EXISTS idx_turn_batches_ts    ON turn_batches(ts);
 CREATE INDEX IF NOT EXISTS idx_turn_batches_model ON turn_batches(model);
 """
@@ -114,30 +140,48 @@ def _db_path() -> Path:
         return Path.home() / ".hermes" / DB_FILENAME
 
 
+def _pid_alive(pid: int) -> bool:
+    """Return whether ``pid`` is a live process on this host.
+
+    Why: The orphan sweep must only reap runs owned by a DEAD prior process. A
+    running row owned by a different but still-alive process is genuine in-flight
+    work and must never be marked crashed — reaping it would corrupt live state.
+    What: Uses ``os.kill(pid, 0)`` — no signal is sent; it only probes existence.
+    Returns True if the process exists (or exists-but-not-permitted, ESRCH=False),
+    False if no such process. Non-positive pids are treated as not-alive.
+    Test: ``test_sweep_orphaned_skips_alive_other_owner`` (monkeypatched True) +
+    the reap tests (monkeypatched False).
+    """
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user — still alive
+    except OSError:
+        return False
+    return True
+
+
 def _apply_wal_with_fallback(conn: sqlite3.Connection) -> None:
     """Set journal_mode=WAL, falling back to DELETE on WAL-incompatible FS.
 
     Why: WAL gives concurrent readers + one writer (what the hooks need), but it
-    is unsupported on NFS/SMB where it raises OperationalError; DELETE works
-    everywhere. Replicated locally to avoid importing hermes_state.
-    What: Tries WAL; on a recognized incompat marker switches to DELETE; an
-    unrelated OperationalError is re-raised (not silently swallowed).
-    Test: Implicit — on the test/local ext4 FS WAL succeeds; the DELETE branch is
-    covered by the marker check.
+    fails on some network filesystems (e.g. ZFS with certain settings, NFS).
+    Falling back to DELETE maintains durability at the cost of concurrency.
+    What: Tries ``PRAGMA journal_mode=WAL``; on error sets ``DELETE``. Logs mode.
+    Test: Covered by test_init_db_on_wal_incompatible_fs.
     """
     try:
-        row = conn.execute("PRAGMA journal_mode").fetchone()
-        if row and (row[0] or "").lower() == "wal":
-            return
-    except sqlite3.OperationalError:
-        pass
-    try:
         conn.execute("PRAGMA journal_mode=WAL")
-    except sqlite3.OperationalError as exc:
-        if not any(m in str(exc).lower() for m in _WAL_INCOMPAT_MARKERS):
-            raise
-        logger.warning("mpm-runs: WAL unsupported on this filesystem (%s) — using DELETE", exc)
+        conn.execute("PRAGMA journal_mode").fetchone()
+        logger.debug("mpm-runs: journal_mode=WAL")
+    except sqlite3.OperationalError:
         conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("PRAGMA journal_mode").fetchone()
+        logger.debug("mpm-runs: journal_mode=DELETE (WAL fallback)")
 
 
 def _connect() -> sqlite3.Connection:
@@ -147,11 +191,21 @@ def _connect() -> sqlite3.Connection:
     connection (autocommit + busy wait) so explicit ``BEGIN IMMEDIATE`` controls
     write transactions and lock contention degrades to waiting, not errors.
     What: Opens with check_same_thread=False, isolation_level=None (autocommit),
-    timeout/busy_timeout=5000ms, WAL (or DELETE fallback), Row factory.
+    timeout/busy_timeout=5000ms, WAL (or DELETE fallback), Row factory. Creates
+    the parent dir best-effort (retried) so a fresh home never fails the write.
     Test: Indirectly via every test; concurrency test stresses the lock waiting.
     """
     path = _db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(3):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            break
+        except OSError as exc:
+            if attempt == 2:
+                logger.error("hermes-mpm: failed to create parent dir %s: %s", path.parent, exc)
+            else:
+                time.sleep(0.1 * (2 ** attempt))
+
     conn = sqlite3.connect(
         str(path),
         check_same_thread=False,
@@ -167,36 +221,43 @@ def _connect() -> sqlite3.Connection:
 def _write(sql: str, params: tuple) -> int:
     """Run one write statement in a BEGIN IMMEDIATE txn with retry-with-jitter.
 
-    Why: Under a delegation burst many threads write at once; ``BEGIN IMMEDIATE``
-    takes the write lock up front (fail fast instead of mid-statement), and the
-    jittered retry absorbs the rare "database is locked" that slips past the
-    busy_timeout — so a tracking write never raises into a hook.
-    What: Opens a connection, retries the txn up to _MAX_WRITE_RETRIES times on
-    OperationalError "database is locked" with 20–150ms jitter; returns rowcount.
-    Test: ``test_concurrent_start_end_no_corruption`` proves 8 threads × 25 runs
-    all land with no corruption / lost rows.
+    Why: SQLite handles concurrent readers well, but writers contend. Without
+    an explicit BEGIN IMMEDIATE the first write might conflict with another
+    writer and get a "database is locked" error. The jitter avoids a thundering
+    herd when multiple processes hit the same locked DB.
+    What: Begins IMMEDIATE, executes, commits, returns the affected rowcount. On
+    "database is locked" sleeps a random 0.01–0.1s and retries up to 3 times.
+    Test: ``test_write_retries_on_locked_db`` + every write-path test.
     """
-    last_exc: Optional[Exception] = None
-    for _attempt in range(_MAX_WRITE_RETRIES):
-        conn = _connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            cur = conn.execute(sql, params)
-            conn.execute("COMMIT")
-            return cur.rowcount
-        except sqlite3.OperationalError as exc:
-            last_exc = exc
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.OperationalError:
-                pass
-            if "database is locked" not in str(exc).lower():
-                raise
-            time.sleep(random.uniform(_RETRY_MIN_MS, _RETRY_MAX_MS) / 1000.0)
-        finally:
+    conn = _connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(sql, params)
+        conn.commit()
+        return cursor.rowcount
+    except sqlite3.OperationalError as exc:
+        if "database is locked" in str(exc).lower():
             conn.close()
-    # Exhausted retries — surface so callers can log+swallow (hooks do).
-    raise last_exc if last_exc else sqlite3.OperationalError("write failed")
+            for attempt in range(3):
+                time.sleep(random.uniform(0.01, 0.1))
+                try:
+                    conn = _connect()
+                    cursor = conn.cursor()
+                    cursor.execute("BEGIN IMMEDIATE")
+                    cursor.execute(sql, params)
+                    conn.commit()
+                    return cursor.rowcount
+                except sqlite3.OperationalError:
+                    if attempt == 2:
+                        raise
+                    continue
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def init_db() -> None:
@@ -204,61 +265,78 @@ def init_db() -> None:
 
     Why: DDL must run exactly at startup, never on a hot write path — concurrent
     CREATE/ALTER is what historically corrupted the kanban DB. Centralizing it
-    here keeps record_start/record_end DDL-free. The ``owner_pid`` ALTER migrates
-    DBs created before process-ownership existed so the orphan sweep can scope to
-    its own runs (the data-corruption fix). The ``max_batch_size``/``turn_count``
-    ALTERs migrate DBs created before batch telemetry so each subagent run can
-    surface whether it batched internally.
-    What: Opens a connection, executescript()s the IF NOT EXISTS schema (fresh DBs
-    get owner_pid + batch columns + turn_batches in CREATE), then ALTER-adds any
-    missing columns if an EXISTING table lacks them — each guarded by a PRAGMA
-    column check so re-runs are a clean no-op.
+    here keeps record_start/record_end DDL-free. The ALTERs migrate DBs created
+    before owner_pid / batch columns existed (a legacy ``runs`` table, or a
+    legacy pre-rename ``subagent_runs`` table renamed by this migration).
+    What: Renames a legacy ``subagent_runs`` table to ``runs`` if present, then
+    executescript()s the IF NOT EXISTS schema, then ALTER-adds any missing
+    columns on an EXISTING ``runs`` table — each guarded by a PRAGMA column check
+    so re-runs are a clean no-op.
     Test: ``test_init_db_is_idempotent`` + ``test_init_db_adds_owner_pid_to_existing_db``
     + ``test_init_db_migrates_legacy_subagent_runs``.
     """
     conn = _connect()
     try:
-        conn.executescript(_SCHEMA_SQL)
-        _ensure_owner_pid_column(conn)
-        _ensure_batch_columns(conn)
+        _migrate_legacy_table_name(conn)
+        conn.executescript(_TABLE_SQL)
+        _ensure_columns(conn)  # fill columns a migrated legacy table may lack
+        conn.executescript(_INDEX_SQL)  # indexes only after columns exist
     finally:
         conn.close()
+    logger.debug("mpm-runs: db ready (schema initialized; sweep deferred to first hook)")
 
 
-def _ensure_owner_pid_column(conn: sqlite3.Connection) -> None:
-    """Idempotently add the owner_pid column to an existing subagent_runs table.
+def _migrate_legacy_table_name(conn: sqlite3.Connection) -> None:
+    """Rename a legacy ``subagent_runs`` table to ``runs`` if it exists.
 
-    Why: A DB created before the process-ownership fix has no owner_pid column;
-    the orphan sweep needs it to distinguish its own in-flight runs from a dead
-    process's. CREATE TABLE IF NOT EXISTS won't add a column to an existing table,
-    so we migrate with an explicit guarded ALTER.
-    What: Reads PRAGMA table_info; if owner_pid is absent, ALTER TABLE ADD COLUMN
-    owner_pid INTEGER. No-op when the column already exists (fresh CREATE path or
-    a prior migration). Runs only inside init_db (never on a hot write path).
-    Test: ``test_init_db_adds_owner_pid_to_existing_db`` (legacy DB + double init).
+    Why: Earlier builds named the table ``subagent_runs``; the current schema
+    uses ``runs``. A live DB on disk must migrate without losing rows.
+    What: If ``subagent_runs`` exists AND ``runs`` does not, ``ALTER TABLE …
+    RENAME``. If both exist (shouldn't happen), leave them — the new ``runs`` is
+    authoritative. No-op on a fresh DB.
+    Test: ``test_init_db_migrates_legacy_subagent_runs``.
     """
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(subagent_runs)")}
-    if "owner_pid" not in cols:
-        conn.execute("ALTER TABLE subagent_runs ADD COLUMN owner_pid INTEGER")
+    names = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('runs','subagent_runs')"
+        )
+    }
+    if "subagent_runs" in names and "runs" not in names:
+        conn.execute("ALTER TABLE subagent_runs RENAME TO runs")
+        logger.debug("mpm-runs: migrated legacy subagent_runs -> runs")
 
 
-def _ensure_batch_columns(conn: sqlite3.Connection) -> None:
-    """Idempotently add max_batch_size/turn_count to an existing subagent_runs.
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """ALTER-add any columns missing from an EXISTING ``runs`` table.
 
-    Why: A DB created before batch telemetry has neither column; record_run_turn
-    needs them to record per-subagent batch behaviour (did this run ever emit a
-    parallel tool batch, and how many turns did it take). CREATE TABLE IF NOT
-    EXISTS won't add columns to an existing table, so we migrate with guarded
-    ALTERs — mirroring the owner_pid migration.
-    What: Reads PRAGMA table_info; ALTER-adds each of max_batch_size / turn_count
-    that is absent. No-op when both already exist. Runs only inside init_db.
-    Test: ``test_init_db_migrates_legacy_subagent_runs`` (legacy DB + double init).
+    Why: A legacy on-disk table may predate owner_pid / batch telemetry columns;
+    the sweep + telemetry paths require them. Each add is guarded so re-running
+    init_db is a clean no-op.
+    What: Reads PRAGMA table_info(runs); ADDs owner_pid, batch_count,
+    max_batch_size, turn_count, summary, error, metadata, delegation_id if absent.
+    Test: ``test_init_db_adds_owner_pid_to_existing_db`` +
+    ``test_init_db_migrates_legacy_subagent_runs``.
     """
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(subagent_runs)")}
-    if "max_batch_size" not in cols:
-        conn.execute("ALTER TABLE subagent_runs ADD COLUMN max_batch_size INTEGER")
-    if "turn_count" not in cols:
-        conn.execute("ALTER TABLE subagent_runs ADD COLUMN turn_count INTEGER")
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+    for col in (
+        "owner_pid",
+        "batch_count",
+        "max_batch_size",
+        "turn_count",
+        "summary",
+        "error",
+        "metadata",
+        "delegation_id",
+    ):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {col} INTEGER" if col in (
+                "owner_pid",
+                "batch_count",
+                "max_batch_size",
+                "turn_count",
+            ) else f"ALTER TABLE runs ADD COLUMN {col} TEXT")
+            logger.debug("mpm-runs: added %s column", col)
 
 
 def record_start(
@@ -268,30 +346,31 @@ def record_start(
     profile: Optional[str],
     goal: Optional[str],
     started_at: int,
-    run_type: Optional[str],
+    run_type: str,
+    *,
     delegation_id: Optional[str] = None,
-    metadata: Optional[dict] = None,
+    owner_pid: Optional[int] = None,
 ) -> None:
-    """Record a run as ``running`` (INSERT OR IGNORE — first write wins).
+    """Record a run start. Idempotent — reinserting the same run_id is a no-op.
 
-    Why: The subagent_start hook may fire more than once for a logically-single
-    run (retries, re-entry); OR IGNORE keeps the original start authoritative and
-    makes the hook safe to call repeatedly. ``owner_pid`` is stamped here so the
-    orphan sweep can reap only PRIOR-process runs, never the current process's own
-    in-flight rows (the data-corruption fix).
-    What: Inserts one ``running`` row keyed by run_id (= child_session_id),
-    stamped with owner_pid = os.getpid().
-    Test: ``test_record_start_creates_running_row`` +
-    ``test_record_start_insert_or_ignore_is_idempotent`` +
+    Why: Every subagent_start hook fires once per spawned child. We capture the
+    initial state so the PM can track what's running and orphaned runs can be
+    detected. ``owner_pid`` defaults to THIS process's pid so the sweep can tell
+    its own in-flight rows from a dead prior process's.
+    What: INSERT OR IGNORE the run row with status='running'. Accepts args
+    positionally (tests) or by keyword (hooks). Uses _write for concurrency.
+    Test: ``test_record_start_creates_running_row``,
+    ``test_record_start_insert_or_ignore_is_idempotent``,
     ``test_record_start_stamps_owner_pid``.
     """
-    meta_json = json.dumps(metadata) if metadata else None
+    if owner_pid is None:
+        owner_pid = os.getpid()
     _write(
         """
-        INSERT OR IGNORE INTO subagent_runs (
-            run_id, parent_session_id, role, profile, goal, status,
-            started_at, delegation_id, run_type, metadata, owner_pid
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO runs (
+            run_id, parent_session_id, role, profile, goal,
+            status, started_at, run_type, delegation_id, owner_pid
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_id,
@@ -301,128 +380,106 @@ def record_start(
             goal,
             STATUS_RUNNING,
             int(started_at),
-            delegation_id,
             run_type,
-            meta_json,
-            os.getpid(),
+            delegation_id,
+            owner_pid,
         ),
     )
 
 
 def record_end(
     run_id: str,
+    *,
     status: str,
     ended_at: int,
     duration_ms: Optional[int] = None,
     summary: Optional[str] = None,
     error: Optional[str] = None,
+    batch_count: Optional[int] = None,
+    max_batch_size: Optional[int] = None,
+    turn_count: Optional[int] = None,
 ) -> None:
-    """Close a run: set its terminal status + end metadata.
+    """Update a running row to its terminal state. Idempotent.
 
-    Why: The subagent_stop hook (and the async-complete fallback) must mark a run
-    finished so it stops counting as in-flight and the orphan sweep leaves it
-    alone on the next restart.
-    What: UPDATEs the row's status/ended_at/duration_ms/summary/error by run_id.
-    No-op if the run_id is unknown (defensive — a stop without a start).
-    Test: ``test_record_end_closes_row`` + ``test_record_end_records_error``.
+    Why: subagent_stop (sync) and pre_llm_call (async complete) both need to
+    close a run. Only a still-``running`` row is closed, so a duplicate close is a
+    no-op. Optional batch telemetry may be folded in at close time.
+    What: UPDATEs the row WHERE run_id matches AND status='running', setting the
+    terminal status, ended_at, and any provided optional columns. Columns not
+    provided are left unchanged (COALESCE) so a close never wipes telemetry a
+    prior hook recorded.
+    Test: ``test_record_end_closes_row``, ``test_record_end_records_error``.
     """
     _write(
         """
-        UPDATE subagent_runs
-           SET status = ?, ended_at = ?, duration_ms = ?, summary = ?, error = ?
-         WHERE run_id = ?
+        UPDATE runs
+           SET status = ?,
+               ended_at = ?,
+               duration_ms = COALESCE(?, duration_ms),
+               summary = COALESCE(?, summary),
+               error = COALESCE(?, error),
+               batch_count = COALESCE(?, batch_count),
+               max_batch_size = COALESCE(?, max_batch_size),
+               turn_count = COALESCE(?, turn_count)
+         WHERE run_id = ? AND status = ?
         """,
-        (status, int(ended_at), duration_ms, summary, error, run_id),
+        (
+            status,
+            int(ended_at),
+            duration_ms,
+            summary,
+            error,
+            batch_count,
+            max_batch_size,
+            turn_count,
+            run_id,
+            STATUS_RUNNING,
+        ),
     )
 
 
-def _pid_alive(pid: int) -> bool:
-    """Best-effort liveness check for a pid via os.kill(pid, 0).
+def record_batch_telemetry(
+    run_id: str,
+    *,
+    batch_count: Optional[int] = None,
+    max_batch_size: Optional[int] = None,
+    turn_count: Optional[int] = None,
+) -> None:
+    """Fold batch telemetry into a running run row (consolidated entry point).
 
-    Why: A defensive guard against the rare same-pid edge case (a recycled pid).
-    If a row's owner pid is still alive, the owner is genuinely running and its
-    run must NOT be reaped — even if it isn't the current process.
-    What: Returns True if os.kill(pid, 0) does not raise ProcessLookupError; a
-    PermissionError means the pid exists but is owned by another user → alive.
-    Any other OSError → treat as not-alive (fail toward reaping a stuck row).
-    Test: Exercised indirectly via the ownership sweep tests; os.kill(getpid(),0)
-    confirms our own process is reported alive.
+    Why: A single, explicit entry point for stamping the per-run batch columns
+    (batch_count / max_batch_size / turn_count) without going through the turn
+    counting logic — used when a caller already has aggregate batch numbers.
+    What: UPDATEs the RUNNING run's batch columns, COALESCE-preserving any column
+    not supplied. No-op if the run doesn't exist or isn't running.
+    Test: ``test_record_batch_telemetry_updates_row``.
     """
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-
-
-def sweep_orphaned(now: int, current_pid: Optional[int] = None) -> int:
-    """Mark PRIOR-process ``running`` rows ``crashed`` (restart durability fill).
-
-    Why: A process that dies mid-run can never fire subagent_stop, so its run
-    would linger ``running`` forever. The original sweep reaped EVERY running row,
-    which corrupted data: any process loading the plugin (the CLI, the dashboard)
-    swept the live gateway's in-flight runs to ``crashed`` and made async runs
-    permanently un-closable. The fix scopes the sweep to runs the CURRENT process
-    does NOT own — a freshly-started gateway owns no prior runs, so this reaps the
-    dead process's runs while never touching anything the current process created.
-    What: UPDATEs running rows whose owner_pid IS NULL (legacy/pre-migration) OR
-    differs from current_pid (default os.getpid()) AND whose owner is not still
-    alive (best-effort os.kill check), setting status='crashed',
-    error='orphaned by restart', ended_at=now. Returns the count reaped.
-    Test: ``test_sweep_orphaned_marks_running_crashed`` +
-    ``test_sweep_orphaned_only_reaps_other_pid_rows``.
-    """
-    if current_pid is None:
-        current_pid = os.getpid()
-
-    conn = _connect()
-    try:
-        candidates = conn.execute(
-            """
-            SELECT run_id, owner_pid FROM subagent_runs
-             WHERE status = ? AND ended_at IS NULL
-               AND (owner_pid IS NULL OR owner_pid != ?)
-            """,
-            (STATUS_RUNNING, current_pid),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    # Defensive: never reap a row whose (other) owner pid is still alive — that
-    # owner is genuinely running; only NULL-owner or dead-owner rows are orphans.
-    reap_ids = [
-        r["run_id"]
-        for r in candidates
-        if r["owner_pid"] is None or not _pid_alive(int(r["owner_pid"]))
-    ]
-    count = 0
-    for run_id in reap_ids:
-        count += _write(
-            """
-            UPDATE subagent_runs
-               SET status = ?, error = ?, ended_at = ?
-             WHERE run_id = ? AND status = ? AND ended_at IS NULL
-            """,
-            (STATUS_CRASHED, _ORPHAN_ERROR, int(now), run_id, STATUS_RUNNING),
-        )
-    return count
+    _write(
+        """
+        UPDATE runs
+           SET batch_count = COALESCE(?, batch_count),
+               max_batch_size = COALESCE(?, max_batch_size),
+               turn_count = COALESCE(?, turn_count)
+         WHERE run_id = ? AND status = ?
+        """,
+        (batch_count, max_batch_size, turn_count, run_id, STATUS_RUNNING),
+    )
 
 
 def query_runs(
+    *,
     status: Optional[str] = None,
+    run_type: Optional[str] = None,
     session: Optional[str] = None,
     since: Optional[int] = None,
-    limit: int = 50,
-) -> list[dict[str, Any]]:
-    """Return runs matching the filters, newest first.
+    limit: Optional[int] = None,
+) -> list[dict]:
+    """Query runs with optional filters, newest-first.
 
-    Why: Backs ``hermes mpm runs`` — a no-LLM query of run history/state.
-    What: SELECT with optional status / parent_session_id / started_at>=since
-    filters, ORDER BY started_at DESC, LIMIT. Returns plain dicts.
+    Why: The CLI (`hermes mpm runs`) and orchestration list/filter runs.
+    What: Builds a dynamic WHERE from status / run_type / parent-session (the
+    ``session`` param) / ``started_at >= since``, orders by started_at DESC, and
+    limits. Returns a list of dicts (one per row).
     Test: ``test_query_runs_filters_and_orders``.
     """
     clauses: list[str] = []
@@ -430,6 +487,9 @@ def query_runs(
     if status:
         clauses.append("status = ?")
         params.append(status)
+    if run_type:
+        clauses.append("run_type = ?")
+        params.append(run_type)
     if session:
         clauses.append("parent_session_id = ?")
         params.append(session)
@@ -437,32 +497,76 @@ def query_runs(
         clauses.append("started_at >= ?")
         params.append(int(since))
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-    sql = "SELECT * FROM subagent_runs" + where + " ORDER BY started_at DESC LIMIT ?"
-    params.append(int(limit))
+    sql = "SELECT * FROM runs" + where + " ORDER BY started_at DESC"
+    if limit:
+        sql += " LIMIT ?"
+        params.append(int(limit))
 
     conn = _connect()
     try:
-        return [dict(r) for r in conn.execute(sql, tuple(params))]
+        return [dict(row) for row in conn.execute(sql, tuple(params))]
     finally:
         conn.close()
+
+
+def sweep_orphaned(now: int, current_pid: Optional[int] = None) -> int:
+    """Mark runs left 'running' by a prior DEAD process as 'crashed'.
+
+    Why: If the gateway restarts mid-run, the child processes are killed but the
+    DB rows still say 'running'. These orphans would linger forever. This sweep
+    marks them 'crashed' so they don't pollute the UI — but ONLY when the owning
+    pid is not the current process AND is not still alive, so a concurrent
+    still-running sibling process's in-flight work is never reaped.
+    What: Finds running rows whose owner_pid is NULL (legacy) OR (!= current_pid
+    AND not alive), then UPDATEs each to 'crashed' with error=_ORPHAN_ERROR and
+    ended_at=now. Returns the count reaped.
+    Test: ``test_sweep_orphaned_marks_running_crashed``,
+    ``test_sweep_orphaned_only_reaps_other_pid_rows``,
+    ``test_sweep_orphaned_skips_alive_other_owner``.
+    """
+    if current_pid is None:
+        current_pid = os.getpid()
+    conn = _connect()
+    try:
+        candidates = conn.execute(
+            "SELECT run_id, owner_pid FROM runs WHERE status = ?",
+            (STATUS_RUNNING,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    reaped = 0
+    for row in candidates:
+        owner = row["owner_pid"]
+        # A row owned by the current process is genuine in-flight work — skip.
+        if owner is not None and owner == current_pid:
+            continue
+        # A row owned by a different but STILL-ALIVE process is also genuine — skip.
+        if owner is not None and _pid_alive(owner):
+            continue
+        # NULL owner (legacy) or a dead prior owner → reap.
+        updated = _write(
+            "UPDATE runs SET status = ?, error = ?, ended_at = ? "
+            "WHERE run_id = ? AND status = ?",
+            (STATUS_CRASHED, _ORPHAN_ERROR, int(now), row["run_id"], STATUS_RUNNING),
+        )
+        reaped += updated
+    return reaped
 
 
 def find_running_by_delegation(delegation_id: str) -> Optional[str]:
     """Return the run_id of a running row carrying ``delegation_id``, if any.
 
     Why: The async-complete fallback needs to close the right run by its
-    delegation_id when one was recorded at start.
+    delegation_id when one was stamped.
     What: SELECTs the newest running run_id whose delegation_id matches.
-    Test: Exercised via the hook-fallback test in test_init_register.py.
+    Test: Exercised via the async-complete hook tests in test_runs_hooks.py.
     """
     conn = _connect()
     try:
         row = conn.execute(
-            """
-            SELECT run_id FROM subagent_runs
-             WHERE delegation_id = ? AND status = ?
-             ORDER BY started_at DESC LIMIT 1
-            """,
+            "SELECT run_id FROM runs WHERE delegation_id = ? AND status = ? "
+            "ORDER BY started_at DESC LIMIT 1",
             (delegation_id, STATUS_RUNNING),
         ).fetchone()
         return row["run_id"] if row else None
@@ -476,26 +580,23 @@ def stamp_delegation_id(goal: str, delegation_id: str, now: Optional[int] = None
     Why: For a direct ``delegate_task(background=True)`` the subagent_start hook
     creates the run row (delegation_id NULL) BEFORE delegate_task returns; the
     synchronous post_tool_call then carries the delegation_id. Stamping it here
-    lets the async-complete marker close the run by EXACT delegation_id instead
-    of fragile goal-text matching. The ``delegation_id IS NULL`` filter is the
-    disambiguator for two sequential identical-goal async runs: the second stamp
-    cannot overwrite the first (it falls through to the next still-null row).
-    What: Finds the newest ``running`` row with this goal AND delegation_id NULL
-    (SELECT by run_id, then UPDATE by run_id — portable across SQLite builds that
-    lack UPDATE…ORDER BY/LIMIT), sets its delegation_id. Returns True iff a row
-    was stamped. ``now`` is accepted for signature symmetry with other writers
-    (unused here — no timestamp is mutated).
+    lets the async-complete marker close the run by EXACT delegation_id instead of
+    fragile goal-text matching. The ``delegation_id IS NULL`` filter disambiguates
+    two sequential identical-goal async runs (the second stamp cannot overwrite
+    the first — it falls through to the next still-null row).
+    What: Finds the newest ``running`` row with this goal AND delegation_id NULL,
+    UPDATEs its delegation_id (re-asserting the NULL guard so a concurrent stamp
+    can't double-write). Returns True iff a row was stamped. ``now`` is accepted
+    for signature symmetry (unused).
     Test: ``test_stamp_delegation_id_*`` in test_runs_db.py.
     """
     del now  # accepted for symmetry; this write mutates no timestamp
     conn = _connect()
     try:
         row = conn.execute(
-            """
-            SELECT run_id FROM subagent_runs
-             WHERE goal = ? AND status = ? AND delegation_id IS NULL
-             ORDER BY started_at DESC LIMIT 1
-            """,
+            "SELECT run_id FROM runs "
+            "WHERE goal = ? AND status = ? AND delegation_id IS NULL "
+            "ORDER BY started_at DESC LIMIT 1",
             (goal, STATUS_RUNNING),
         ).fetchone()
         run_id = row["run_id"] if row else None
@@ -503,12 +604,8 @@ def stamp_delegation_id(goal: str, delegation_id: str, now: Optional[int] = None
         conn.close()
     if run_id is None:
         return False
-    # Re-assert the NULL guard in the UPDATE so a concurrent stamp can't double-write.
     updated = _write(
-        """
-        UPDATE subagent_runs SET delegation_id = ?
-         WHERE run_id = ? AND delegation_id IS NULL
-        """,
+        "UPDATE runs SET delegation_id = ? WHERE run_id = ? AND delegation_id IS NULL",
         (delegation_id, run_id),
     )
     return updated > 0
@@ -517,12 +614,10 @@ def stamp_delegation_id(goal: str, delegation_id: str, now: Optional[int] = None
 def find_running_by_goal(goal: str) -> Optional[str]:
     """Return the run_id of the SOLE running row whose goal matches, else None.
 
-    Why: This is now only a LAST-RESORT fallback — delegation_id correlation
-    (stamp_delegation_id + find_running_by_delegation) is the primary path. Goal
-    text at completion can be truncated/reformatted, and two async runs can share
-    a goal, so this must never GUESS: if more than one running row matches, return
-    None and leave the ambiguous pair for the honest crash-sweep rather than
-    closing the wrong row.
+    Why: A LAST-RESORT fallback — delegation_id correlation is primary. Goal text
+    at completion can be truncated/reformatted, and two async runs can share a
+    goal, so this must never GUESS: if more than one running row matches, return
+    None and leave the ambiguous pair for the honest crash-sweep.
     What: Counts running rows with an exact goal match; returns the run_id only
     when EXACTLY one matches (ambiguity guard), else None.
     Test: ``test_find_running_by_goal_returns_none_when_ambiguous`` +
@@ -531,11 +626,7 @@ def find_running_by_goal(goal: str) -> Optional[str]:
     conn = _connect()
     try:
         rows = conn.execute(
-            """
-            SELECT run_id FROM subagent_runs
-             WHERE goal = ? AND status = ?
-             ORDER BY started_at DESC
-            """,
+            "SELECT run_id FROM runs WHERE goal = ? AND status = ? ORDER BY started_at DESC",
             (goal, STATUS_RUNNING),
         ).fetchall()
         if len(rows) != 1:
@@ -561,7 +652,7 @@ def purge_old(retention_days: int, now: Optional[int] = None) -> int:
         now = int(time.time())
     cutoff = int(now) - retention_days * 86400
     return _write(
-        "DELETE FROM subagent_runs WHERE ended_at IS NOT NULL AND ended_at < ?",
+        "DELETE FROM runs WHERE ended_at IS NOT NULL AND ended_at < ?",
         (cutoff,),
     )
 
@@ -579,29 +670,23 @@ def record_turn_batch(
 ) -> int:
     """Record one LLM turn's assistant tool-call count (the batch signal).
 
-    Why: This is the global, queryable parallelism signal — one row per turn that
-    emitted >=1 tool call, for BOTH the main agent and every subagent. >1 means
-    the assistant batched tool calls in a single turn (parallelism working); 1
-    means a single call. Recording it durably lets ``batch_stats`` compute the
-    batch rate by SELECT/GROUP BY instead of a fragile ad-hoc classifier. Callers
-    record only turns with ``tool_call_count >= 1`` (a 0-tool turn carries no batch
-    signal); this writes whatever it is given.
+    Why: The global, queryable parallelism signal — one row per turn that emitted
+    >=1 tool call, for BOTH the main agent and every subagent. >1 means the
+    assistant batched tool calls (parallelism working). Recording it durably lets
+    ``batch_stats`` compute the batch rate by SELECT/GROUP BY. Callers record only
+    turns with tool_call_count >= 1; this writes whatever it is given.
     What: INSERT OR IGNORE one row keyed by api_request_id (first write wins — the
-    post_api_request hook may fire more than once for a logically-single request),
-    using the same write-path/retry pattern as the rest of the module. Returns the
-    rowcount: 1 when the row was newly inserted, 0 on a duplicate (OR IGNORE) — so
-    the caller can gate the per-run fold (record_run_turn) on a NEW turn and avoid
-    double-counting turn_count on a duplicate fire.
+    hook may fire more than once for a logically-single request). Returns the
+    rowcount: 1 when newly inserted, 0 on a duplicate — so the caller can gate the
+    per-run fold on a NEW turn and avoid double-counting turn_count.
     Test: ``test_record_turn_batch_inserts_row`` +
     ``test_record_turn_batch_idempotent_on_api_request_id`` +
     ``test_record_turn_batch_returns_rowcount``.
     """
     return _write(
-        """
-        INSERT OR IGNORE INTO turn_batches (
-            api_request_id, turn_id, session_id, model, tool_call_count, ts
-        ) VALUES (?, ?, ?, ?, ?, ?)
-        """,
+        "INSERT OR IGNORE INTO turn_batches "
+        "(api_request_id, turn_id, session_id, model, tool_call_count, ts) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
         (api_request_id, turn_id, session_id, model, int(tool_call_count), int(ts)),
     )
 
@@ -614,14 +699,12 @@ def batch_stats(
 
     Why: Backs ``hermes mpm parallelism`` — turns the raw per-turn rows into the
     one number operators ask for: the batch rate (fraction of tool-turns that
-    batched >1 call), overall and per model. No LLM, no ad-hoc classifier.
+    batched >1 call), overall and per model.
     What: SELECT/GROUP BY over turn_batches with optional ts>=since and model=
-    filters. Returns ``{tool_turns, multi_tool_turns, batch_rate, by_model}`` where
-    by_model maps each model to the same three numbers. batch_rate is
+    filters. Returns ``{tool_turns, multi_tool_turns, batch_rate, by_model}``
+    where by_model maps each model to the same three numbers. batch_rate is
     multi_tool_turns / tool_turns (0.0 when there are no tool-turns).
-    Test: ``test_batch_stats_computes_rate`` (3,1,2 -> rate 0.667),
-    ``test_batch_stats_empty_is_zero_rate``, ``test_batch_stats_per_model_breakdown``,
-    ``test_batch_stats_since_filter``, ``test_batch_stats_model_filter``.
+    Test: ``test_batch_stats_*`` in test_turn_batches.py.
     """
     clauses: list[str] = []
     params: list[Any] = []
@@ -646,8 +729,6 @@ def batch_stats(
 
     tool_turns = 0
     multi_tool_turns = 0
-    # Keys are the stored model id, which is nullable (the hook records
-    # model=kw.get("model")), so a None key is possible; callers must be None-safe.
     by_model: dict[Optional[str], dict[str, Any]] = {}
     for r in rows:
         turns = int(r["turns"] or 0)
@@ -668,34 +749,27 @@ def batch_stats(
 
 
 def record_run_turn(session_id: str, tool_call_count: int) -> None:
-    """Fold one turn's batch signal into its running subagent_run row.
+    """Fold one turn's batch signal into its running ``runs`` row.
 
     Why: ``hermes mpm runs`` should show, per subagent, whether that run ever
     batched tool calls — without a second query. We correlate by
-    ``run_id == session_id``: the subagent_start hook stores the
-    child's ``session_id`` as ``run_id`` (verified in delegate_tool.py), and the
-    per-turn post_api_request hook carries that same ``session_id`` for the child's
-    turns. The MAIN agent's turns carry the parent session_id, which matches no run
-    row — so this is a correct no-op for the PM (the global turn_batches store
-    still captures it).
+    ``run_id == session_id`` (subagent_start stores the child's session_id as
+    run_id, and the per-turn post_api_request hook carries that same session_id
+    for the child's turns). The MAIN agent's turns carry the parent session_id,
+    which matches no run row — a correct no-op for the PM.
     What: For the RUNNING run whose run_id == session_id, set turn_count =
     COALESCE(turn_count,0)+1 and max_batch_size = MAX(COALESCE(max_batch_size,0),
-    tool_call_count). NOTE: the caller (the post_api_request hook) only invokes
-    this for turns with tool_call_count >= 1, so turn_count counts TOOL-EMITTING
-    turns, not total turns. No-op when no running run matches (unknown id, or
-    already ended — an ended run is left frozen). Uses the standard
-    write-path/retry.
+    tool_call_count). Caller invokes this only for turns with count >= 1, so
+    turn_count counts TOOL-EMITTING turns. No-op when no running run matches.
     Test: ``test_record_run_turn_updates_running_run``,
     ``test_record_run_turn_max_logic_does_not_lower``,
     ``test_record_run_turn_noop_when_no_matching_running_run``.
     """
     _write(
-        """
-        UPDATE subagent_runs
-           SET turn_count = COALESCE(turn_count, 0) + 1,
-               max_batch_size = MAX(COALESCE(max_batch_size, 0), ?)
-         WHERE run_id = ? AND status = ?
-        """,
+        "UPDATE runs "
+        "SET turn_count = COALESCE(turn_count, 0) + 1, "
+        "    max_batch_size = MAX(COALESCE(max_batch_size, 0), ?) "
+        "WHERE run_id = ? AND status = ?",
         (int(tool_call_count), session_id, STATUS_RUNNING),
     )
 

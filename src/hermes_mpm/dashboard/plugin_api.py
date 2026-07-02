@@ -145,7 +145,7 @@ def _query_runs(
         clauses.append("started_at >= ?")
         params.append(int(since))
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-    sql = "SELECT * FROM subagent_runs" + where + " ORDER BY started_at DESC LIMIT ?"
+    sql = "SELECT * FROM runs" + where + " ORDER BY started_at DESC LIMIT ?"
     params.append(int(limit))
 
     conn = _reader_connect()
@@ -217,7 +217,7 @@ def get_runs_stats() -> dict[str, Any]:
         return {"stats": counts, "total": 0}
     try:
         rows = conn.execute(
-            "SELECT status, COUNT(*) AS n FROM subagent_runs GROUP BY status"
+            "SELECT status, COUNT(*) AS n FROM runs GROUP BY status"
         ).fetchall()
         for row in rows:
             counts[row["status"]] = int(row["n"])

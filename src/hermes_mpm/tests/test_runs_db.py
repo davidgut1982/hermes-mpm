@@ -41,7 +41,7 @@ def _rows(path):
     conn = sqlite3.connect(str(path))
     try:
         conn.row_factory = sqlite3.Row
-        return [dict(r) for r in conn.execute("SELECT * FROM subagent_runs")]
+        return [dict(r) for r in conn.execute("SELECT * FROM runs")]
     finally:
         conn.close()
 
@@ -216,17 +216,17 @@ def test_sweep_orphaned_only_reaps_other_pid_rows(db, monkeypatch):
 
     # Row owned by a prior (dead) process — must be reaped.
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        "INSERT INTO runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("prior", runs_db.STATUS_RUNNING, 1, prior_pid),
     )
     # Row with NULL owner_pid (legacy / pre-migration) — must be reaped.
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        "INSERT INTO runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("legacy", runs_db.STATUS_RUNNING, 1, None),
     )
     # Row owned by the CURRENT process — must be left untouched.
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        "INSERT INTO runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("mine", runs_db.STATUS_RUNNING, 1, current_pid),
     )
 
@@ -247,7 +247,7 @@ def test_sweep_orphaned_skips_alive_other_owner(db, monkeypatch):
     monkeypatch.setattr(runs_db, "_pid_alive", lambda pid: True)
     other_pid = os.getpid() + 1
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        "INSERT INTO runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("alive_other", runs_db.STATUS_RUNNING, 1, other_pid),
     )
     n = runs_db.sweep_orphaned(now=500, current_pid=os.getpid())
@@ -297,7 +297,7 @@ def _pragma_cols(path):
     conn = sqlite3.connect(str(path))
     try:
         conn.row_factory = sqlite3.Row
-        return [dict(r) for r in conn.execute("PRAGMA table_info(subagent_runs)")]
+        return [dict(r) for r in conn.execute("PRAGMA table_info(runs)")]
     finally:
         conn.close()
 

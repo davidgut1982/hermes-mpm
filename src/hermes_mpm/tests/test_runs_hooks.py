@@ -33,7 +33,7 @@ def _rows(path):
     conn = sqlite3.connect(str(path))
     try:
         conn.row_factory = sqlite3.Row
-        return {r["run_id"]: dict(r) for r in conn.execute("SELECT * FROM subagent_runs")}
+        return {r["run_id"]: dict(r) for r in conn.execute("SELECT * FROM runs")}
     finally:
         conn.close()
 
@@ -234,7 +234,7 @@ def test_register_does_not_sweep_when_not_gateway(db, monkeypatch):
     monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
     # A live run owned by some other (gateway) process.
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        "INSERT INTO runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("live", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
     )
 
@@ -256,7 +256,7 @@ def test_register_does_not_sweep_even_when_gateway(db, monkeypatch):
     # Prior dead process's run — would be reaped by a sweep, but register() must
     # NOT sweep, so it must survive untouched here.
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        "INSERT INTO runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("prior", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
     )
 
@@ -277,12 +277,12 @@ def test_maybe_startup_maintenance_sweeps_once_when_gateway(db, monkeypatch):
     monkeypatch.setattr(runs_db, "_pid_alive", lambda pid: False)
     # Prior dead process's run — should be reaped by the lazy sweep.
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        "INSERT INTO runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("prior", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
     )
     # This process's own run — must survive (current pid).
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        "INSERT INTO runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("mine", runs_db.STATUS_RUNNING, 1, os.getpid()),
     )
 
@@ -297,7 +297,7 @@ def test_maybe_startup_maintenance_sweeps_once_when_gateway(db, monkeypatch):
     # A second call must be a no-op: re-insert a fresh prior-process orphan and
     # confirm the latch keeps it from being swept again.
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        "INSERT INTO runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("prior2", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
     )
     hermes_mpm._maybe_run_startup_maintenance()
@@ -310,7 +310,7 @@ def test_maybe_startup_maintenance_noop_when_not_gateway(db, monkeypatch):
     touch the live gateway's in-flight runs)."""
     monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        "INSERT INTO runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("live", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
     )
 
@@ -377,7 +377,7 @@ def test_subagent_start_handler_triggers_maintenance_then_records(db, monkeypatc
     monkeypatch.setattr(runs_db, "_pid_alive", lambda pid: False)
     # A prior-process orphan that the top-of-handler maintenance should reap.
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        "INSERT INTO runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("prior", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
     )
 
@@ -399,7 +399,7 @@ def test_pre_llm_call_async_handler_triggers_maintenance(db, monkeypatch):
     # pytest, which the sweep correctly skips) so the reap premise is deterministic.
     monkeypatch.setattr(runs_db, "_pid_alive", lambda pid: False)
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        "INSERT INTO runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("prior", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
     )
 
@@ -415,7 +415,7 @@ def test_register_does_not_sweep_only_init_db(db, monkeypatch):
     even with no _HERMES_GATEWAY env. A pre-existing orphan survives load."""
     monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
     runs_db._write(
-        "INSERT INTO subagent_runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
+        "INSERT INTO runs (run_id, status, started_at, owner_pid) VALUES (?, ?, ?, ?)",
         ("orphan", runs_db.STATUS_RUNNING, 1, os.getpid() + 1),
     )
 

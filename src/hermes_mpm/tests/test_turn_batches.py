@@ -43,7 +43,7 @@ def _run_rows(path):
     conn = sqlite3.connect(str(path))
     try:
         conn.row_factory = sqlite3.Row
-        return {r["run_id"]: dict(r) for r in conn.execute("SELECT * FROM subagent_runs")}
+        return {r["run_id"]: dict(r) for r in conn.execute("SELECT * FROM runs")}
     finally:
         conn.close()
 
@@ -208,8 +208,8 @@ def test_purge_old_turn_batches_disabled_when_non_positive(db):
 
 
 def test_init_db_creates_turn_batches_and_run_columns(db):
-    """Fresh init_db creates turn_batches and the new subagent_runs columns."""
-    cols = {r["name"] for r in _pragma_cols(db, "subagent_runs")}
+    """Fresh init_db creates turn_batches and the new runs columns."""
+    cols = {r["name"] for r in _pragma_cols(db, "runs")}
     assert "max_batch_size" in cols
     assert "turn_count" in cols
     # turn_batches exists and is queryable.
@@ -241,7 +241,7 @@ def test_init_db_migrates_legacy_subagent_runs(tmp_path, monkeypatch):
         conn.close()
 
     runs_db.init_db()  # must ALTER without raising
-    cols = {r["name"] for r in _pragma_cols(path, "subagent_runs")}
+    cols = {r["name"] for r in _pragma_cols(path, "runs")}
     assert "max_batch_size" in cols
     assert "turn_count" in cols
 
@@ -250,7 +250,7 @@ def test_init_db_migrates_legacy_subagent_runs(tmp_path, monkeypatch):
     assert _run_rows(path)["legacy"]["max_batch_size"] == 4
 
     runs_db.init_db()  # second init is a clean no-op
-    assert "turn_count" in {r["name"] for r in _pragma_cols(path, "subagent_runs")}
+    assert "turn_count" in {r["name"] for r in _pragma_cols(path, "runs")}
 
 
 def _pragma_cols(path, table):

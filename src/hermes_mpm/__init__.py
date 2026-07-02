@@ -237,7 +237,7 @@ def _make_async_complete_handler():
             # at start (the common case — start has no delegation_id).
             if delegation_id:
                 runs_db._write(
-                    "UPDATE subagent_runs SET delegation_id = ? WHERE run_id = ?",
+                    "UPDATE runs SET delegation_id = ? WHERE run_id = ?",
                     (delegation_id, run_id),
                 )
         except Exception as exc:
@@ -357,7 +357,7 @@ def _make_post_api_request_handler():
     What: Returns handler(**kw) that extracts the tool-call count + session_id +
     turn_id + api_request_id + model. When count >= 1 it records the global
     turn-level signal (record_turn_batch, keyed by api_request_id) AND folds it
-    into the matching running subagent_run (record_run_turn, correlated by
+    into the matching running run (record_run_turn, correlated by
     session_id == run_id). count == 0 records nothing (no batch signal). A missing
     api_request_id (no PK) is skipped cleanly. All errors are logged+swallowed.
     Test: ``test_post_api_request_*`` in test_runs_hooks.py.
